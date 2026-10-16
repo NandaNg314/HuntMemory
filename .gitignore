@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+mcp-server/node_modules/
+
+# Nested clone of the upstream HuntMemory project (not part of this repo)
+HuntMemory/
+
+# Build outputs / transient binaries (shipped hmkpm_cli is committed on purpose)
+helper/*.o
+helper/*.d
+helper/hmkpm_cli_test
+helper/hmkpm_cli_new
+helper/hmkpm_cli_werror
+*.elf
+
+# Logs and temp files
+*.log
+*.tmp
+*.bak
+*.backup
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Env / secrets
+.env
+.env.*
+.dev.vars*
+wrangler.env

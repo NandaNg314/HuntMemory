@@ -1,0 +1,101 @@
+name: Build hmkpm_cli (arm64)
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'helper/**'
+      - 'mcp-server/**'
+      - '.github/workflows/cli.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'helper/**'
+      - 'mcp-server/**'
+      - '.github/workflows/cli.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: write
+
+jobs:
+  build-cli:
+    name: Cross-compile hmkpm_cli (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Android SDK & NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;29.0.14206865'
+
+      - name: Set NDK environment
+        run: |
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/29.0.14206865" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/29.0.14206865" >> $GITHUB_ENV
+
+      - name: Compile hmkpm_cli.c
+        run: |
+          TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          CC="$TC/bin/aarch64-linux-android31-clang"
+          "$CC" -O3 -Wall -Wextra -Werror helper/hmkpm_cli.c -o helper/hmkpm_cli
+          chmod 755 helper/hmkpm_cli
+          file helper/hmkpm_cli
+
+      - name: Verify binary architecture
+        run: |
+          TRIPLE=$(readelf -h helper/hmkpm_cli | awk '/Machine:/{print $2, $3, $4, $5}')
+          echo "Machine: $TRIPLE"
+          readelf -h helper/hmkpm_cli | grep -q "AArch64" || { echo "NOT an AArch64 binary"; exit 1; }
+
+      - name: Upload hmkpm_cli artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hmkpm_cli-arm64-${{ github.sha }}
+          path: |
+            helper/hmkpm_cli
+            helper/hmkpm_cli.c
+            helper/Makefile
+          retention-days: 30
+
+      - name: Attach binary to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: helper/hmkpm_cli
+
+  check-mcp:
+    name: Check MCP server (Node)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: mcp-server
+        run: npm ci
+
+      - name: Syntax-check all sources
+        working-directory: mcp-server
+        run: |
+          for f in index.js server.js tools.js device.js; do
+            node --check "$f"
+            echo "OK: $f"
+          done
+
+      - name: Smoke-test MCP tool registration (offline)
+        working-directory: mcp-server
+        env:
+          HMKPM_TEST_OFFLINE: "1"
+        run: node test-client.mjs
