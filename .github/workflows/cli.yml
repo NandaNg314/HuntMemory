@@ -84,12 +84,15 @@ jobs:
       # repo or running npm install. node_modules is installed on the device the
       # first time (`npm install` in the unpacked dir), which keeps the zip small
       # and avoids shipping platform-specific native bindings.
+      #
+      # test-client.mjs is included on purpose: a downloader needs a way to
+      # verify the deploy without trusting that "it started" means "it works".
       - name: Pack the MCP server
         run: |
           rm -rf /tmp/hmkpm-mcp && mkdir -p /tmp/hmkpm-mcp
           cp mcp-server/index.js mcp-server/server.js mcp-server/tools.js \
-             mcp-server/device.js mcp-server/package.json \
-             mcp-server/package-lock.json /tmp/hmkpm-mcp/
+             mcp-server/device.js mcp-server/test-client.mjs \
+             mcp-server/package.json mcp-server/package-lock.json /tmp/hmkpm-mcp/
           cp README.md /tmp/hmkpm-mcp/README.md
           (cd /tmp && zip -qr "$GITHUB_WORKSPACE/hmkpm-mcp-server.zip" hmkpm-mcp)
           unzip -l hmkpm-mcp-server.zip
