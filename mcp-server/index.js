@@ -3,7 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import http from "node:http";
-import { buildServer } from "./server.js";
+import { buildServer, VERSION } from "./server.js";
 
 const argv = process.argv.slice(2);
 const has = (f) => argv.includes(f);
@@ -54,7 +54,7 @@ async function runHttp() {
       res.end(JSON.stringify({
         status: "ok",
         service: "hmkpm-mcp",
-        version: "1.0.0",
+        version: VERSION,
         endpoints: {
           sse: "/sse",
           messages: "/messages?sessionId=...",

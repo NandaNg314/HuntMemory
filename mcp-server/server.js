@@ -1,6 +1,20 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { readFileSync } from "node:fs";
 import { makeTools } from "./tools.js";
+
+// Read the version from package.json so a release only has to be bumped in one
+// place; a hardcoded string here silently drifts from the published package.
+export const VERSION = (() => {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(new URL("./package.json", import.meta.url), "utf8"),
+    );
+    return pkg.version || "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+})();
 
 const TYPES = ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64"];
 
@@ -28,7 +42,7 @@ export function buildServer(options) {
   const tools = makeTools(options);
   const server = new McpServer({
     name: "hmkpm-mcp",
-    version: "1.0.0",
+    version: VERSION,
   });
 
   // 1. hmkpm_probe
