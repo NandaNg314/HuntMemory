@@ -66,6 +66,20 @@ jobs:
           fi
           echo "OK: no DT_NEEDED entries (fully static)"
 
+      # Package the Node side so a download is deployable without cloning the
+      # repo or running npm install. node_modules is installed on the device the
+      # first time (`npm install` in the unpacked dir), which keeps the zip small
+      # and avoids shipping platform-specific native bindings.
+      - name: Pack the MCP server
+        run: |
+          rm -rf /tmp/hmkpm-mcp && mkdir -p /tmp/hmkpm-mcp
+          cp mcp-server/index.js mcp-server/server.js mcp-server/tools.js \
+             mcp-server/device.js mcp-server/package.json \
+             mcp-server/package-lock.json /tmp/hmkpm-mcp/
+          cp README.md /tmp/hmkpm-mcp/README.md
+          (cd /tmp && zip -qr "$GITHUB_WORKSPACE/hmkpm-mcp-server.zip" hmkpm-mcp)
+          unzip -l hmkpm-mcp-server.zip
+
       - name: Upload hmkpm_cli artifact
         uses: actions/upload-artifact@v4
         with:
@@ -74,6 +88,7 @@ jobs:
             helper/hmkpm_cli
             helper/hmkpm_cli.c
             helper/Makefile
+            hmkpm-mcp-server.zip
           retention-days: 30
 
       - name: Attach binary to release
@@ -82,6 +97,7 @@ jobs:
         with:
           files: |
             helper/hmkpm_cli
+            hmkpm-mcp-server.zip
             start_tablet.sh
             service_boot.sh
 
