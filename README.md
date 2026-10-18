@@ -82,7 +82,7 @@ return #hits, #keep
 | `hm.pid` | 当前目标 pid |
 | `hm.read(addr, type)` | 读值，失败返回 `nil, errno` |
 | `hm.write(addr, type, value)` | 写值，成功返回 `true` |
-| `hm.read_bytes(addr, n)` / `hm.write_bytes(addr, str)` | 原始字节读写 |
+| `hm.read_bytes(addr, n)` / `hm.write_bytes(addr, str)` | 原始字节读写。`read_bytes` 返回 `字符串[, 缺失字节数]`：完全读不到时返回 `nil, errno`；部分页不可读时仍返回缓冲区，第二个值告诉你有多少字节是零填充的空洞 |
 | `hm.chain(base_or_module, rva, {off1, off2, ...})` | 多级指针链，末段偏移不解析；失败返回 `nil, 第几步` |
 | `hm.scan(type, value, {align, perms, module, limit})` | 搜索，返回 `{{addr=..., value=...}, ...}` |
 | `hm.freeze(addr_list, type, value, interval_ms)` / `hm.unfreeze()` | 冻结/解除，与 `freeze_value` 共用同一个守护进程 |

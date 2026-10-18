@@ -586,7 +586,7 @@ export function buildServer(options) {
       title: "Run a Lua script against the target's memory",
       description:
         "Execute a Lua script that reads and writes the target's memory through a synchronous hm.* API, in one call instead of a round trip per operation. Use it for multi-step work: scan, then filter, then confirm, then write, then re-check. The script runs OUTSIDE the target process (it is not injected); it only reaches memory through hm.*. " +
-        "API: hm.pid; hm.read(addr,type) -> value|nil,errno; hm.write(addr,type,value) -> true|nil,errno; hm.read_bytes(addr,n) -> string|nil; hm.write_bytes(addr,str) -> true|nil; " +
+        "API: hm.pid; hm.read(addr,type) -> value|nil,errno; hm.write(addr,type,value) -> true|nil,errno; hm.read_bytes(addr,n) -> string[,unreadable_bytes] (nil,errno only when nothing is readable); hm.write_bytes(addr,str) -> true|nil; " +
         "hm.chain(base_or_module, rva, {off1,off2,...}) -> addr|nil,failed_step (last offset not dereferenced); " +
         "hm.scan(type,value,{align,perms,module,limit}) -> {{addr,value},...} (omit limit to get every hit; a small limit makes the kernel under-report); " +
         "hm.freeze(addr_list,type,value,interval_ms) -> written_count; hm.unfreeze(); hm.module(name) -> {base,stop,vmas}; hm.map(path_filter) -> {{start,stop,size,perms,path}}; " +

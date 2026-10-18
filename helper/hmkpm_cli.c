@@ -128,12 +128,18 @@ static int hex_digit(char c) {
 // which is the layout hmkpm expects (struct hmkpm_req header, then the caller's
 // buffer). Reads that cross into an unreadable page are retried page by page so
 // a hole in the middle of a mapping does not lose the readable part around it.
-static bool raw_read(int pid, uint64_t addr, void *out, size_t size) {
+//
+// `unreadable_out`, when given, receives the number of bytes that could not be
+// read (they are zero-filled in `out`). A caller that only needs the readable
+// bytes can use the count instead of treating the whole read as failed.
+static bool raw_read_count(int pid, uint64_t addr, void *out, size_t size,
+                           size_t *unreadable_out) {
+    if (unreadable_out) *unreadable_out = 0;
     if (size == 0) return true;
     size_t cap = size < READ_SPAN_MAX ? size : READ_SPAN_MAX;
     size_t total_len = sizeof(struct hmkpm_req) + cap;
     uint8_t *buf = (uint8_t *)malloc(total_len);
-    if (!buf) return false;
+    if (!buf) { if (unreadable_out) *unreadable_out = size; return false; }
 
     struct hmkpm_req *req = (struct hmkpm_req *)buf;
     uint8_t *data = buf + sizeof(struct hmkpm_req);
@@ -141,6 +147,7 @@ static bool raw_read(int pid, uint64_t addr, void *out, size_t size) {
 
     bool all_ok = true;
     size_t done = 0;
+    size_t holes = 0;
     while (done < size) {
         size_t want = size - done;
         if (want > cap) want = cap;
@@ -158,6 +165,7 @@ static bool raw_read(int pid, uint64_t addr, void *out, size_t size) {
             // A single unreadable byte: nothing to narrow.
             ((uint8_t *)out)[done] = 0;
             all_ok = false;
+            holes += 1;
             done += 1;
             continue;
         }
@@ -180,10 +188,16 @@ static bool raw_read(int pid, uint64_t addr, void *out, size_t size) {
         }
         memset(dst + done, 0, want);
         all_ok = false;
+        holes += want;
         done += want;
     }
     free(buf);
+    if (unreadable_out) *unreadable_out = holes;
     return all_ok;
+}
+
+static bool raw_read(int pid, uint64_t addr, void *out, size_t size) {
+    return raw_read_count(pid, addr, out, size, NULL);
 }
 
 // Read a single value of `size` bytes (1-8). Returns false when unreadable.
@@ -2689,23 +2703,41 @@ static int lua_hm_write(lua_State *L) {
     return 1;
 }
 
-// hm.read_bytes(addr, n) -> string, or nil + errno.
+// hm.read_bytes(addr, n) -> string [, unreadable_byte_count]
+//
+// raw_read zero-fills pages the kernel refuses, so the bytes that do exist are
+// still worth returning: discarding a 1 MiB read because one page in the middle
+// is unmapped defeats the purpose. The buffer is always returned, and the count
+// of bytes that could not be read is passed as a second value so a caller can
+// decide whether to trust it.
 static int lua_hm_read_bytes(lua_State *L) {
     uint64_t addr = lua_to_addr(L, 1);
     lua_Integer n = luaL_checkinteger(L, 2);
     if (n <= 0 || n > (lua_Integer)LUA_RESULT_BYTES_MAX) {
-        luaL_error(L, "read_bytes size must be 1..%d", LUA_RESULT_BYTES_MAX);
+        return luaL_error(L, "read_bytes size must be 1..%d", LUA_RESULT_BYTES_MAX);
     }
-    char *buf = (char *)lua_newuserdatauv(L, (size_t)n, 0);
-    if (!raw_read(g_lua_pid, addr, buf, (size_t)n)) {
-        lua_pop(L, 1);
+    // malloc + pushlstring rather than userdata: Lua strings are immutable and
+    // the bytes are needed on the stack anyway, so a second copy is wasted work.
+    char *buf = (char *)malloc((size_t)n);
+    if (!buf) return luaL_error(L, "out of memory");
+    size_t holes = 0;
+    bool all = raw_read_count(g_lua_pid, addr, buf, (size_t)n, &holes);
+    if (holes == (size_t)n) {
+        // Nothing at all was readable: this is a failed read, not a partial one,
+        // so report it the same way hm.read does.
+        free(buf);
         lua_pushnil(L);
         lua_pushinteger(L, EFAULT);
         return 2;
     }
-    // Hand Lua a copy as a string; the userdata is a scratch buffer only.
     lua_pushlstring(L, buf, (size_t)n);
-    return 1;
+    free(buf);
+    if (all) return 1;
+    // Partial read: the buffer is still returned, with the number of zero-filled
+    // bytes as a second value. A caller that needs guaranteed-valid data must
+    // check it; one that only needs the surrounding bytes can use them.
+    lua_pushinteger(L, (lua_Integer)holes);
+    return 2;
 }
 
 // hm.write_bytes(addr, string) -> true or nil + errno.
