@@ -70,7 +70,7 @@ const run = async () => {
     "hmkpm_probe", "list_processes", "list_maps",
     "read_memory", "read_value", "write_memory", "write_value",
     "scan_kernel",
-    "scan_unknown", "scan_filter", "scan_results", "scan_reset",
+    "scan_seed", "scan_unknown", "scan_filter", "scan_results", "scan_reset",
   ];
   for (const t of expected) {
     check(`tool registered: ${t}`, toolNames.includes(t));
@@ -98,19 +98,46 @@ const run = async () => {
   const maps = await callTool("list_maps", { pid, filter: "dalvik-main" });
   const mapList = JSON.parse(maps.result?.content?.[0]?.text || "[]");
   console.log("First dalvik map:", mapList[0]);
-  const testAddr = mapList[0]?.start || "0x2000000";
+  check("list_maps returns dalvik maps", mapList.length > 0 && typeof mapList[0].start === "string");
 
-  console.log(`\n=== 4. read_memory at ${testAddr} (16 bytes) ===`);
-  const readMem = await callTool("read_memory", { pid, address: testAddr, size: 16 });
-  check("read_memory returns hex", readMem.result?.content?.[0]?.text?.includes('"hex"'));
+  // Do NOT probe a mapping's base. dalvik-main is a 512 MB reservation whose
+  // first pages are not resident, so hmkpm correctly answers EFAULT there.
+  // Ask the kernel for an address it just proved readable instead: scan for a
+  // common value and use the first hit (reads and writes are then guaranteed
+  // to target a resident page). Falls back to +4 KiB into the first rw-p map.
+  const kernelProbe = await callTool("scan_kernel", { pid, value: 1, type: "i32", align: 4, perms: "rw-p" }, 120000);
+  const probeHits = JSON.parse(kernelProbe.result?.content?.[0]?.text || "{}").matches || [];
+  let readAddr = probeHits[0];
+  if (!readAddr) {
+    const rw = await callTool("list_maps", { pid, filter: "rw-p" });
+    const rwMaps = JSON.parse(rw.result?.content?.[0]?.text || "[]");
+    readAddr = rwMaps[0] ? `0x${(BigInt(rwMaps[0].start) + 0x1000n).toString(16)}` : "0x10000";
+  }
+  console.log("readable address:", readAddr);
 
-  console.log(`\n=== 5. read_value at ${testAddr} (i32) ===`);
-  const readVal = await callTool("read_value", { pid, address: testAddr, type: "i32" });
-  check("read_value returns value", readVal.result?.content?.[0]?.text?.includes('"value"'));
+  console.log(`\n=== 4. read_memory at ${readAddr} (16 bytes) ===`);
+  const readMem = await callTool("read_memory", { pid, address: readAddr, size: 16 });
+  const readMemText = readMem.result?.content?.[0]?.text || "";
+  console.log("read_memory:", readMemText.slice(0, 160));
+  check("read_memory returns hex", readMemText.includes('"hex"'));
 
-  console.log(`\n=== 6. write_value at ${testAddr} ===`);
-  const writeVal = await callTool("write_value", { pid, address: testAddr, type: "i32", value: 0 });
-  check("write_value returns ok", writeVal.result?.content?.[0]?.text?.includes('"status"'));
+  console.log(`\n=== 5. read_value at ${readAddr} (i32) ===`);
+  const readVal = await callTool("read_value", { pid, address: readAddr, type: "i32" });
+  const readValText = readVal.result?.content?.[0]?.text || "";
+  console.log("read_value:", readValText.slice(0, 160));
+  check("read_value returns value", readValText.includes('"value"'));
+
+  // Only touch processes we own or that are declared safe to write to. Writing
+  // into systemui's dalvik head (the old smoke test did) crashes the tablet's UI.
+  // Set HMKPM_TEST_WRITE_PID to a throwaway process to exercise write_value.
+  const writePid = Number(process.env.HMKPM_TEST_WRITE_PID || 0);
+  console.log(`\n=== 6. write_value ===`);
+  if (writePid) {
+    const writeVal = await callTool("write_value", { pid: writePid, address: readAddr, type: "i32", value: 0 });
+    check("write_value returns ok", writeVal.result?.content?.[0]?.text?.includes('"status"'));
+  } else {
+    console.log("  SKIPPED (set HMKPM_TEST_WRITE_PID=<disposable pid> to enable; never write to system processes)");
+  }
 
   // scan_kernel over a 500MB dalvik space is very slow; gate it behind a flag
   // so the default smoke test stays fast.
@@ -131,8 +158,20 @@ const run = async () => {
   check("scan_reset ok", reset0.result?.content?.[0]?.text?.includes('"reset": true') ||
                           reset0.result?.content?.[0]?.text?.includes('"reset":true'));
 
+  console.log("\n=== 9a. scan_seed 1 (fast path, exact value) ===");
+  const seed = await callTool("scan_seed", { pid, value: 1, type: "i32" }, 180000);
+  const seedText = seed.result?.content?.[0]?.text || "";
+  console.log("scan_seed:", seedText);
+  const seedData = JSON.parse(seedText || "{}");
+  check("scan_seed returns a count", typeof seedData.count === "number");
+  const filtSeed = await callTool("scan_filter", { pid, type: "i32", mode: "eq", value: 1 }, 180000);
+  const filtSeedText = filtSeed.result?.content?.[0]?.text || "";
+  console.log("scan_filter(eq 1):", filtSeedText);
+  check("scan_seed session narrows", JSON.parse(filtSeedText || "{}").count !== undefined);
+  await callTool("scan_reset", { pid, type: "i32" });
+
   console.log("\n=== 9. scan_unknown (first pass, may take a while) ===");
-  const unknown = await callTool("scan_unknown", { pid, type: "i32" }, 120000);
+  const unknown = await callTool("scan_unknown", { pid, type: "i32" }, 180000);
   const unknownText = unknown.result?.content?.[0]?.text || "";
   console.log("scan_unknown:", unknownText);
   const unknownData = JSON.parse(unknownText || "{}");

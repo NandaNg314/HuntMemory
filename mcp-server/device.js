@@ -31,7 +31,7 @@ export class AdbDevice {
     adbPath = "adb",
     cliPath = DEFAULT_CLI,
     useSu = true,
-    timeout = 30000,
+    timeout = 120000,
     isLocal = process.platform === "android" || Boolean(process.env.LOCAL_ANDROID),
   } = {}) {
     this.serial = serial || null;
@@ -40,6 +40,11 @@ export class AdbDevice {
     this.useSu = useSu;
     this.timeout = timeout;
     this.isLocal = isLocal;
+    // On-device (tablet) runs start from a root service whose PATH is the
+    // Android system PATH; the node/su binaries live in Termux's prefix.
+    // Pass an explicit binary where PATH cannot be relied on.
+    this.suPath = process.env.HMKPM_SU || "su";
+    this.nodePath = process.env.HMKPM_NODE || "node";
   }
 
   baseArgs() {
@@ -58,7 +63,7 @@ export class AdbDevice {
     if (this.isLocal) {
       // Running directly on Android device (e.g. Termux or native service)
       if (this.useSu) {
-        stdout = await run("su", ["-c", remote], { timeout: this.timeout });
+        stdout = await run(this.suPath, ["-c", remote], { timeout: this.timeout });
       } else {
         stdout = await run(this.cliPath, cliArgs.map(String), { timeout: this.timeout });
       }

@@ -14,7 +14,7 @@ UNAME_M := $(shell uname -m 2>/dev/null)
 ifeq ($(UNAME_M),aarch64)
     CC := clang
     CFLAGS := -O3 -Wall -Wextra
-    LDFLAGS :=
+    LDFLAGS := -static
 else
     # Cross-compiling with NDK if available
     NDK ?= $(if $(ANDROID_NDK_HOME),$(ANDROID_NDK_HOME),$(NDK_HOME))
@@ -32,8 +32,11 @@ else
     else
         CC ?= aarch64-linux-android-clang
     endif
+    # -static: the helper must run under su / magisk context straight from
+    # /data/local/tmp, where loading the system libc and bionic allocator is
+    # fragile; a static ELF only needs the kernel.
     CFLAGS ?= -O3 -Wall -Wextra
-    LDFLAGS ?=
+    LDFLAGS ?= -static
 endif
 
 all: $(TARGET)

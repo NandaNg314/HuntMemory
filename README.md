@@ -40,6 +40,10 @@ hmkpm-mcp/
 | `write_memory` | 向目标内存地址写入原始十六进制字节 | `pid`, `address`, `hex_data` |
 | `write_value` | 按指定类型修改数值（金币、血量、浮点坐标等） | `pid`, `address`, `type`, `value` |
 | `scan_kernel` | **内核空间 NEON SIMD 极速数值搜索** (HMKPM_MAGIC_SCAN_KERNEL) | `pid`, `value`, `type`, `align`, `perms` |
+| `scan_seed` | **模糊搜索第一步（快）**：先把精确值命中写进会话，再配合 `scan_filter` 收敛 | `pid`, `value`, `type`, `align`, `perms` |
+| `scan_unknown` | 模糊搜索第一步（慢）：快照所有对齐槽位（结果可能被 `SESSION_MAX` 截断） | `pid`, `type`, `align`, `perms` |
+| `scan_filter` | 后续轮次：按 `changed/unchanged/increased/decreased/eq/ne/gt/lt/range` 收敛候选 | `pid`, `type`, `mode`, `value` |
+| `scan_results` / `scan_reset` | 列出剩余候选地址（上限 4096）/ 删除会话 | `pid`, `type` |
 
 ---
 
@@ -53,11 +57,33 @@ hmkpm-mcp/
 我们已将开机服务脚本部署至 APatch 的开机脚本目录：
 `/data/adb/service.d/hmkpm_mcp.sh`
 * 平板每次开机后，会自动检查并加载 `hmkpm.kpm` 驱动，并在后台自动拉起 MCP Server，监听 `http://0.0.0.0:8799`。
+* 开机服务的 `PATH` 里**没有** Termux，所以启动脚本必须用绝对路径调用 Node：
+  `/data/data/com.termux/files/usr/bin/node`（脚本 `start_tablet.sh` 已内置，可用 `HMKPM_NODE` 覆盖）。
+  旧版本脚本用 `node index.js` 直接启动，日志里只会留下 `node: not found`，服务永远起不来。
+* 排障看 `/data/local/tmp/mcp.log`；想临时禁用自启，`touch /data/local/tmp/hmkpm_mcp.disabled`。
 
 #### 2. 手动启动/重启（若需要）
 在平板 Termux 或 Root 终端中直接执行：
 ```bash
 su -c '/data/local/tmp/start_tablet.sh'
+# 已经在跑时会直接返回；要重启先 ps 找到 node 进程 kill 掉再执行
+```
+
+#### 2.1 重新部署（电脑端）
+```bash
+adb push helper/hmkpm_cli /data/local/tmp/hmkpm_cli
+adb push mcp-server/server.js mcp-server/tools.js mcp-server/device.js mcp-server/test-client.mjs /data/local/tmp/hmkpm-mcp/
+adb push start_tablet.sh /data/local/tmp/start_tablet.sh
+adb push service_boot.sh /data/local/tmp/hmkpm_mcp.sh
+adb shell "chmod 755 /data/local/tmp/hmkpm_cli /data/local/tmp/start_tablet.sh /data/local/tmp/hmkpm_mcp.sh"
+adb shell "su -c 'cp /data/local/tmp/hmkpm_mcp.sh /data/adb/service.d/ && chmod 755 /data/adb/service.d/hmkpm_mcp.sh'"
+```
+> 注意：`adb push mcp-server /data/local/tmp/hmkpm-mcp` 会多套一层 `mcp-server/` 目录（服务器会加载旧文件），必须按上面逐个文件推送。
+
+#### 2.2 自检
+```bash
+adb shell "curl -s http://127.0.0.1:8799/health"          # 健康检查
+adb shell "su -c /data/local/tmp/run_suite.sh"            # 跑 mcp-server/test-client.mjs
 ```
 
 #### 3. 平板端 Operit 连接配置

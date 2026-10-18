@@ -198,7 +198,31 @@ export function buildServer(options) {
     },
   );
 
-  // 8. scan_unknown -- first pass of a fuzzy / differential scan
+  // 8. scan_seed -- fast exact-value seed for a fuzzy scan session
+  server.registerTool(
+    "scan_seed",
+    {
+      title: "Fuzzy scan: seed session with an exact value (fast path)",
+      description:
+        "Start a scan session by searching for an exact known/near value using the kernel SIMD scan, then store the hits (address+value) into a session keyed by (pid, type). This is the fast, GameGuardian-style path: the candidate set starts small and targeted, unlike scan_unknown which snapshots every slot and can truncate on large processes. After seeding, change the value in-game and call scan_filter to narrow down. NOTE: session is destroyed when the target process restarts.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        value: z.union([z.string(), z.number()]).describe("Exact value to search for."),
+        type: z.enum(TYPES).default("i32").describe("Data type (default i32)."),
+        align: z.number().int().positive().optional().describe("Memory alignment in bytes (e.g. 1, 2, 4, 8). Defaults to type size."),
+        perms: z.string().default("rw-p").describe("Memory permission filter. Default \"rw-p\"."),
+      },
+    },
+    async ({ pid, value, type, align, perms }) => {
+      try {
+        return ok(await tools.scanSeed({ pid, value, type, align, perms }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // 9. scan_unknown -- first pass of a fuzzy / differential scan
   server.registerTool(
     "scan_unknown",
     {

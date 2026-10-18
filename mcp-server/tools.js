@@ -20,8 +20,22 @@ export class HmkpmTools {
     this.device = device;
   }
 
+  // Health check: probe the kernel module AND report how the CLI is reached, so
+  // a broken deployment (wrong uid, missing su, stale binary) is diagnosable.
   async probe() {
-    return this.device.invoke(["probe"]);
+    const res = await this.device.invoke(["probe"]);
+    const info = {
+      ...res,
+      transport: this.device.isLocal ? "local" : "adb",
+      cli: this.device.cliPath,
+      useSu: this.device.useSu,
+    };
+    if (res && res.status === "error") {
+      info.hint = this.device.isLocal
+        ? "HMKPM needs root: the MCP server must run as uid 0 (su -c) on the tablet."
+        : "Check adb devices / root (su) on the device.";
+    }
+    return info;
   }
 
   async listProcesses({ filter } = {}) {
@@ -83,6 +97,19 @@ export class HmkpmTools {
   async scanKernel({ pid, value, type = "i32", align, perms = "rw-p" }) {
     assertType(type);
     const args = ["scan", String(pid), type, formatValueForCli(type, value)];
+    if (align !== undefined && align !== null) {
+      args.push(String(align));
+      if (perms) args.push(perms);
+    } else if (perms) {
+      args.push(perms);
+    }
+    return this.device.invoke(args);
+  }
+
+  // Fast path: seed a scan session from an exact value (GameGuardian-style).
+  async scanSeed({ pid, value, type = "i32", align, perms = "rw-p" }) {
+    assertType(type);
+    const args = ["scan_seed", String(pid), type, formatValueForCli(type, value)];
     if (align !== undefined && align !== null) {
       args.push(String(align));
       if (perms) args.push(perms);
