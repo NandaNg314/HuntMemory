@@ -2,11 +2,18 @@ name: Build hmkpm_cli (arm64)
 
 on:
   push:
+    # A single `push` entry is required: repeating the key would make the
+    # second block override the first. Listing both branches and tags here
+    # means branch pushes still honour the paths filter, while tag pushes
+    # ignore it (path filters never match tag refs) and go straight to release.
     branches: [ main, master ]
+    tags: [ 'v*' ]
     paths:
       - 'helper/**'
       - 'mcp-server/**'
       - '.github/workflows/cli.yml'
+      - 'start_tablet.sh'
+      - 'service_boot.sh'
   pull_request:
     branches: [ main, master ]
     paths:
@@ -95,6 +102,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          body_path: .github/RELEASE_NOTES.md
           files: |
             helper/hmkpm_cli
             hmkpm-mcp-server.zip
