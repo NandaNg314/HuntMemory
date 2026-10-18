@@ -630,5 +630,115 @@ export function buildServer(options) {
     },
   );
 
+  // 25. trace_watchpoint -- ARM64 hardware watchpoint & execution breakpoint
+  server.registerTool(
+    "trace_watchpoint",
+    {
+      title: "Trace memory accesses and execution using ARM64 hardware breakpoints/watchpoints",
+      description:
+        "Monitor memory read/write hits or instruction execution at a specific address using ARM64 hardware debug registers (DBGBVR/DBGBCR for exec, DBGWVR/DBGWCR for read/write). " +
+        "Captures the triggering instruction (e.g. STR W0, [X19, #0x28]), caller return address (LR), " +
+        "full unwound call stack, module name and relative offset (RVA), plus complete register snapshots (PC, SP, LR, FP, X0-X30, PSTATE) without modifying target code.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        address: z
+          .union([z.string(), z.number()])
+          .describe("Target memory address to monitor (e.g. '0x7a81001234' or integer)."),
+        size: z
+          .number()
+          .int()
+          .refine((n) => [1, 2, 4, 8].includes(n), { message: "size must be 1, 2, 4, or 8" })
+          .default(4)
+          .describe("Watchpoint byte size (1, 2, 4, or 8). Default: 4. Ignored for 'exec' breakpoints."),
+        type: z
+          .enum(["write", "read", "access", "exec"])
+          .default("write")
+          .describe("Trigger type: 'write' (Store, DBGWVR), 'read' (Load, DBGWVR), 'access' (both, DBGWVR), or 'exec' (Instruction Breakpoint, DBGBVR). Default: 'write'."),
+        durationMs: z
+          .number()
+          .int()
+          .min(100)
+          .max(30000)
+          .default(2000)
+          .describe("Monitoring duration in milliseconds (default: 2000ms, max: 30000ms)."),
+        maxHits: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .default(10)
+          .describe("Maximum number of hits to record before auto-stopping (default: 10)."),
+      },
+    },
+    async ({ pid, address, size, type, durationMs, maxHits }) => {
+      try {
+        return ok(await tools.traceWatchpoint({ pid, address, size, type, durationMs, maxHits }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // 26. thread_suspend -- suspend target thread or entire process
+  server.registerTool(
+    "thread_suspend",
+    {
+      title: "Suspend target thread or process and capture register state + call stack",
+      description: "Suspend a specific thread (or main thread) in the target process. Returns current PC, LR, full registers (X0-X30, SP, FP), and unwound call stack.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        tid: z.number().int().min(0).default(0).describe("Specific thread ID (0 = target main PID)."),
+      },
+    },
+    async ({ pid, tid }) => {
+      try {
+        return ok(await tools.threadSuspend({ pid, tid }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // 27. thread_resume -- resume target thread or entire process
+  server.registerTool(
+    "thread_resume",
+    {
+      title: "Resume target thread or process",
+      description: "Resume a previously suspended thread or process.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        tid: z.number().int().min(0).default(0).describe("Specific thread ID (0 = target main PID)."),
+      },
+    },
+    async ({ pid, tid }) => {
+      try {
+        return ok(await tools.threadResume({ pid, tid }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // 28. thread_step -- single-step target thread N instructions
+  server.registerTool(
+    "thread_step",
+    {
+      title: "Single-step target thread N instructions",
+      description: "Single-step a suspended thread for N instructions, recording PC, disassembled instruction, and register changes at each step.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        tid: z.number().int().min(0).default(0).describe("Specific thread ID (0 = target main PID)."),
+        steps: z.number().int().min(1).max(100).default(1).describe("Number of instructions to step (default: 1, max: 100)."),
+      },
+    },
+    async ({ pid, tid, steps }) => {
+      try {
+        return ok(await tools.threadStep({ pid, tid, steps }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
   return server;
 }

@@ -55,6 +55,10 @@ hmkpm-mcp/
 | `scan_rva` | **模块内搜索，输出 RVA**：结果以模块偏移表示，跨重启有效 | `pid`, `module`, `value`, `type`, `align` |
 | `find_instructions` | **ARM64 指令搜索**：支持掩码通配，例如 `B9000000/FFF00000` 匹配任意寄存器的 32 位 STR；结果带模块名与 RVA | `pid`, `pattern`, `where`, `limit` |
 | `run_lua` | **Lua 脚本批量操作**：一次调用内完成「扫描 → 过滤 → 确认 → 写值 → 复查」多步操作，省掉每步一个来回 | `pid`, `script`, `timeoutS` |
+| `trace_watchpoint` | **ARM64 硬件断点与数据观察点**：直接利用芯片底层的 `DBGBVR`/`DBGBCR`（执行断点）与 `DBGWVR`/`DBGWCR`（数据读写）监控任意指令与变量，自动捕获触发指令反汇编、调用方 LR、AAPCS-64 完整回溯调用栈、模块与 RVA 偏移及全套寄存器快照（PC, SP, LR, FP, X0-X30, PSTATE） | `pid`, `address`, `size`, `type` (`write`/`read`/`access`/`exec`), `durationMs`, `maxHits` |
+| `thread_suspend` | **挂起目标线程或进程**：暂停目标指定线程（或主线程），现场抓取当前 PC、LR、全套通用寄存器（X0-X30, SP, FP）与调用栈回溯 | `pid`, `tid` |
+| `thread_resume` | **恢复目标线程或进程**：恢复之前暂停的目标线程或整个进程执行 | `pid`, `tid` |
+| `thread_step` | **单步控制执行**：对挂起线程执行 N 条指令单步步进，记录每步的 PC、反汇编指令与关键寄存器变化 | `pid`, `tid`, `steps` |
 
 ### Lua 脚本（`run_lua`）
 

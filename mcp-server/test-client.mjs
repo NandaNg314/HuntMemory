@@ -73,7 +73,8 @@ const run = async () => {
     "scan_seed", "scan_unknown", "scan_filter", "scan_results", "scan_reset",
     "read_values", "find_string", "module_base",
     "pointer_chain", "freeze_value", "unfreeze_value", "list_freezes",
-    "dump_memory", "scan_rva", "find_instructions", "run_lua",
+    "dump_memory", "scan_rva", "find_instructions", "run_lua", "trace_watchpoint",
+    "thread_suspend", "thread_resume", "thread_step",
   ];
   for (const t of expected) {
     check(`tool registered: ${t}`, toolNames.includes(t));

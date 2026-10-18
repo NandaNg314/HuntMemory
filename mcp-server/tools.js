@@ -262,6 +262,41 @@ export class HmkpmTools {
       { stdin: script },
     );
   }
+
+  // Hardware breakpoint / watchpoint: trace read/write/exec hits with register snapshots & call stack.
+  async traceWatchpoint({ pid, address, size = 4, type = "write", durationMs = 2000, maxHits = 10 }) {
+    const sz = Number(size) || 4;
+    const dur = Number(durationMs) || 2000;
+    const hits = Number(maxHits) || 10;
+    let accessType = "w";
+    if (type === "read") accessType = "r";
+    else if (type === "access" || type === "rw") accessType = "rw";
+    else if (type === "exec" || type === "instruction" || type === "break") accessType = "exec";
+    return this.device.invoke([
+      "watch",
+      String(pid),
+      asHex(address),
+      String(sz),
+      accessType,
+      String(dur),
+      String(hits),
+    ]);
+  }
+
+  // Suspend target thread or process and capture register state + call stack
+  async threadSuspend({ pid, tid = 0 }) {
+    return this.device.invoke(["thread_suspend", String(pid), String(tid || 0)]);
+  }
+
+  // Resume target thread or process
+  async threadResume({ pid, tid = 0 }) {
+    return this.device.invoke(["thread_resume", String(pid), String(tid || 0)]);
+  }
+
+  // Single-step target thread N instructions and capture instruction trace
+  async threadStep({ pid, tid = 0, steps = 1 }) {
+    return this.device.invoke(["step", String(pid), String(tid || 0), String(steps || 1)]);
+  }
 }
 
 // The CLI parses numbers with strtol/strtoul base 0 (so "0x.." works) and

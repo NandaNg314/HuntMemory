@@ -10,6 +10,7 @@ on:
     tags: [ 'v*' ]
     paths:
       - 'helper/**'
+      - 'companion_kpm/**'
       - 'mcp-server/**'
       - '.github/workflows/cli.yml'
       - 'start_tablet.sh'
@@ -60,7 +61,7 @@ jobs:
           # upstream and unreachable: run_lua never opens the os library.
           LUA_SRCS=$(find helper/vendor/lua -name '*.c' | sort)
           "$CC" -O2 -Wall -Wextra -Wno-deprecated-declarations \
-            -Wno-unused-parameter -static -I helper/vendor/lua \
+            -Wno-unused-parameter -static -I helper -I helper/vendor/lua \
             helper/hmkpm_cli.c $LUA_SRCS -lm -o helper/hmkpm_cli
           chmod 755 helper/hmkpm_cli
           file helper/hmkpm_cli

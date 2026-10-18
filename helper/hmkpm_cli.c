@@ -3376,6 +3376,8 @@ static int cmd_processes(void) {
     return 0;
 }
 
+#include "hwbp.c"
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("HMKPM CLI Utility v1.2\n"
@@ -3404,6 +3406,10 @@ int main(int argc, char **argv) {
                "  scan_rva     <pid> <module> <type> <value> [align]          (reports offsets, not addresses)\n"
                "  find_instructions <pid> <pattern[/mask]> <module|x-perms> [limit]\n"
                "  dump         <pid> <addr|module:NAME> <size|all> <out_path> [perms]\n"
+               "  watch        <pid> <addr> [size=1|2|4|8] [type=w|r|rw|exec] [duration_ms] [max_hits]\n"
+               "  thread_suspend <pid> [tid]\n"
+               "  thread_resume  <pid> [tid]\n"
+               "  step           <pid> [tid] [count]\n"
                "\n"
                "Value freezing (detached daemon):\n"
                "  freeze_add    <pid> <type> <value> <interval_ms> [addr ...]  (no addr = use scan session)\n"
@@ -3534,6 +3540,27 @@ int main(int argc, char **argv) {
         // find_instructions <pid> <pattern[/mask]> <module|perms> [limit]
         return cmd_find_instructions(atoi(argv[2]), argv[3], argv[4],
                                      argc >= 6 ? atoi(argv[5]) : 100);
+    } else if (strcmp(cmd, "watch") == 0 && argc >= 4) {
+        // watch <pid> <addr> [size] [type] [duration_ms] [max_hits]
+        int pid = atoi(argv[2]);
+        uint64_t addr = strtoull(argv[3], NULL, 0);
+        size_t sz = argc >= 5 ? (size_t)strtoul(argv[4], NULL, 0) : 4;
+        const char *t = argc >= 6 ? argv[5] : "w";
+        uint32_t dur = argc >= 7 ? (uint32_t)strtoul(argv[6], NULL, 0) : 2000;
+        uint32_t max_hits = argc >= 8 ? (uint32_t)strtoul(argv[7], NULL, 0) : 10;
+        return cmd_watch(pid, addr, sz, t, dur, max_hits);
+    } else if (strcmp(cmd, "thread_suspend") == 0 && argc >= 3) {
+        // thread_suspend <pid> [tid]
+        return cmd_thread_suspend(atoi(argv[2]), argc >= 4 ? atoi(argv[3]) : 0);
+    } else if (strcmp(cmd, "thread_resume") == 0 && argc >= 3) {
+        // thread_resume <pid> [tid]
+        return cmd_thread_resume(atoi(argv[2]), argc >= 4 ? atoi(argv[3]) : 0);
+    } else if (strcmp(cmd, "step") == 0 && argc >= 3) {
+        // step <pid> [tid] [count]
+        int pid = atoi(argv[2]);
+        int tid = argc >= 4 ? atoi(argv[3]) : 0;
+        int steps = argc >= 5 ? atoi(argv[4]) : 1;
+        return cmd_step(pid, tid, steps);
     } else if (strcmp(cmd, "run_lua") == 0 && argc >= 4) {
         // run_lua <pid> <script_path|-> [timeout_s]
         return cmd_run_lua(atoi(argv[2]), argv[3],
