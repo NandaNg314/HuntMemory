@@ -1,6 +1,6 @@
-## v1.2.1 新增了什么 (子线程枚举与动态寄存器改写，共 30 个工具)
+## v1.2.1 新增与修复 (子线程枚举、动态寄存器改写与 KPM 内核伴侣模块修复)
 
-这个版本带来了第 **29、30 个** MCP 原生工具，将动态逆向调试推进至完整闭环：
+这个版本带来了第 **29、30 个** MCP 原生工具，并将伴侣内核模块完全对齐 KernelPatch 规范：
 
 ### 1. 枚举进程子线程（`list_threads`，第 29 个工具）
 - **子线程一览无余**：自动遍历 `/proc/<pid>/task/`，提取所有子线程的 TID、线程名（`comm`，如 `UnityMain`、`RenderThread`、`Jit thread pool`）与运行状态（`state`）。
@@ -9,6 +9,10 @@
 ### 2. 动态改写寄存器（`set_register`，第 30 个工具）
 - **任意寄存器热改写**：在线程被挂起或单步执行时，直接修改 `PC`、`SP`、`LR`、`FP`、`X0`~`X30`、`W0`~`W30` 或 `PSTATE`。
 - **劫持执行流与返回值**：直接修改 `X0` 伪造函数返回结果（绕过校验），或修改 `PC` 强制跳转指定汇编逻辑。
+
+### 3. KernelPatch 伴侣模块重构与 APatch 加载修复 (`companion_kpm/hm_hwbp.kpm`)
+- **根治 APatch 加载 -1 报错**：排查内核日志精确定位 `overflow in relocation type 261 val ...` 错误，禁用 unwinding 表并彻底剔除 `.eh_frame`，根除 ARM64 `R_AARCH64_PREL32` 32位相对寻址溢出。
+- **对齐 KernelPatch ABI 规范**：使用规范的 `KPM_INIT`、`KPM_CTL0`、`KPM_EXIT` 宏和 `hook_fargs3_t` 系统调用短路回调，支持在 APatch 中平滑加载。
 
 ---
 

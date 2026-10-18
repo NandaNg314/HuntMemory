@@ -208,3 +208,12 @@ adb shell "su -c /data/local/tmp/run_suite.sh"            # 跑 mcp-server/test-
   }
 }
 ```
+
+---
+
+## 硬件断点内核伴侣模块 (`companion_kpm`)
+
+在逆向具有强反作弊、反调试（如检测 `TracerPid != 0`）的目标进程时，可选用我们提供的内核伴侣驱动：
+* **模块路径**：`companion_kpm/hm_hwbp.kpm`
+* **安装方法**：直接在 **APatch 管理器 -> 模块 -> 加载 KPM 模块**，点选该文件刷入即可。
+* **特性**：通过拦截系统调用 150 隐蔽投递断点事件，目标进程无感知运行。即使未刷入该 KPM，底层也会自动回退至 Linux 原生 ARM64 硬件调试引擎正常运作。
