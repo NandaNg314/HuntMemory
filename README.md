@@ -44,6 +44,40 @@ hmkpm-mcp/
 | `scan_unknown` | 模糊搜索第一步（慢）：快照所有对齐槽位（结果可能被 `SESSION_MAX` 截断） | `pid`, `type`, `align`, `perms` |
 | `scan_filter` | 后续轮次：按 `changed/unchanged/increased/decreased/eq/ne/gt/lt/range` 收敛候选 | `pid`, `type`, `mode`, `value` |
 | `scan_results` / `scan_reset` | 列出剩余候选地址（上限 4096）/ 删除会话 | `pid`, `type` |
+| `read_values` | **批量读值**：一次调用读多个地址，每个地址带 `readable` 标志，用于筛完候选后快速查看 | `pid`, `addresses`, `type` |
+| `find_string` | 字面量字符串搜索（配置键、URL、JSON 片段），用于从字符串反查数据结构 | `pid`, `pattern`, `perms`, `limit` |
+| `module_base` | 模块加载基址 + 可选 RVA，并返回模块结束地址与 VMA 数量 | `pid`, `module`, `rva` |
+| `pointer_chain` | **多级指针链解析**：`base+rva -> [off1] -> [off2] -> ...`，最后一段偏移不解析、直接作为字段地址。基址可直接写模块名，重启后依然有效 | `pid`, `base`, `rva`, `offsets`, `type` |
+| `freeze_value` | **数值冻结**：让守护进程持续回写指定地址，应用覆写不掉。不传 `addresses` 时冻结当前扫描会话的全部幸存地址 | `pid`, `type`, `value`, `addresses`, `intervalMs` |
+| `unfreeze_value` | 解除冻结（不传地址则全部解除，守护进程退出） | `pid`, `addresses` |
+| `list_freezes` | 查看已冻结地址、写入的字节与守护进程存活状态 | `pid` |
+| `dump_memory` | **内存/模块导出到文件**：流式写盘，附带 `.txt` 映射表（文件偏移 ↔ 地址 ↔ 权限），可直接导入 IDA/Ghidra | `pid`, `target`, `size`, `outPath`, `perms` |
+| `scan_rva` | **模块内搜索，输出 RVA**：结果以模块偏移表示，跨重启有效 | `pid`, `module`, `value`, `type`, `align` |
+| `find_instructions` | **ARM64 指令搜索**：支持掩码通配，例如 `B9000000/FFF00000` 匹配任意寄存器的 32 位 STR；结果带模块名与 RVA | `pid`, `pattern`, `where`, `limit` |
+
+### 典型工作流
+
+```
+list_processes                      -> 拿到 pid
+scan_seed    i32=100                -> 初筛（约 0.2s）
+scan_filter  changed                -> 数值变化后收敛
+scan_filter  eq 200                 -> 再收敛
+read_values  剩下的地址             -> 逐个确认当前值
+write_value / freeze_value          -> 改值，或冻结让值稳定
+```
+
+原生（C++/Unity）应用的稳定定位方式：
+
+```
+module_base  libil2cpp.so                -> 拿基址
+pointer_chain libil2cpp.so 0x1A2B3C0 [0x18, 0x20, 0x8]
+                                         -> 一次解析整条链，重启后只需重跑
+dump_memory  libil2cpp.so -> /sdcard/lib.so
+find_instructions B9000000/FFF00000
+                                         -> 找到写该字段的指令，定位更新函数
+```
+
+**关于冻结**：`freeze_value` 会启动一个独立守护进程（同一二进制 `_freeze_daemon`），在设备上持续回写。实测每 50ms 回写一次时 CPU 占用约 0.4% 单核。目标进程退出或执行 `unfreeze_value` 后守护进程自动结束，不会残留。
 
 ---
 

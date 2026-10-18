@@ -72,6 +72,8 @@ const run = async () => {
     "scan_kernel",
     "scan_seed", "scan_unknown", "scan_filter", "scan_results", "scan_reset",
     "read_values", "find_string", "module_base",
+    "pointer_chain", "freeze_value", "unfreeze_value", "list_freezes",
+    "dump_memory", "scan_rva", "find_instructions",
   ];
   for (const t of expected) {
     check(`tool registered: ${t}`, toolNames.includes(t));
@@ -131,11 +133,37 @@ const run = async () => {
   // Only touch processes we own or that are declared safe to write to. Writing
   // into systemui's dalvik head (the old smoke test did) crashes the tablet's UI.
   // Set HMKPM_TEST_WRITE_PID to a throwaway process to exercise write_value.
+  // The throwaway has its own address space, so its slots must be found in it,
+  // never borrowed from the process under test.
   const writePid = Number(process.env.HMKPM_TEST_WRITE_PID || 0);
   console.log(`\n=== 6. write_value ===`);
+  let writeSlot = null;
+  const findSlot = async (targetPid) => {
+    // A truncated kernel scan can come back with all-zero addresses, so look for
+    // the stamped 0x11111111 pattern the target fills its page with: a unique
+    // value guarantees an untruncated, trustworthy hit list.
+    const hits = JSON.parse(
+      (await callTool("scan_kernel", {
+        pid: targetPid, value: 0x11111111, type: "i32", perms: "rw-p",
+      })).result?.content?.[0]?.text || "{}",
+    ).matches || [];
+    return hits.find((a) => BigInt(a) !== 0n) || null;
+  };
   if (writePid) {
-    const writeVal = await callTool("write_value", { pid: writePid, address: readAddr, type: "i32", value: 0 });
-    check("write_value returns ok", writeVal.result?.content?.[0]?.text?.includes('"status"'));
+    writeSlot = await findSlot(writePid);
+    check("throwaway process has a writable slot", Boolean(writeSlot));
+    if (writeSlot) {
+      const writeVal = await callTool("write_value", {
+        pid: writePid, address: writeSlot, type: "i32", value: 0,
+      });
+      const wvText = writeVal.result?.content?.[0]?.text || "";
+      check("write_value returns ok", wvText.includes('"status"') && !wvText.includes('"error"'));
+      const back = JSON.parse(
+        (await callTool("read_value", { pid: writePid, address: writeSlot, type: "i32" }))
+          .result?.content?.[0]?.text || "{}",
+      );
+      check("write_value actually lands", Number(back.value) === 0);
+    }
   } else {
     console.log("  SKIPPED (set HMKPM_TEST_WRITE_PID=<disposable pid> to enable; never write to system processes)");
   }
@@ -225,6 +253,149 @@ const run = async () => {
     (await callTool("module_base", { pid, module: "libc.so", rva: 0x1000 })).result?.content?.[0]?.text || "{}",
   );
   check("module_base adds the RVA", BigInt(modRva.address) === BigInt(modData.base) + 0x1000n);
+
+  // --- Address resolution and code search ---------------------------------
+  // Walk a real two-hop chain: a slot inside libc's data that holds a pointer,
+  // then the field at a fixed offset inside the pointed-to object. Locating the
+  // slot from a scan keeps the test valid across libc versions.
+  console.log("\n=== 17. pointer_chain ===");
+  const libBase = BigInt(modData.base);
+  const libEnd = BigInt(modData.module_end || modData.base);
+
+  // Find a slot that really holds a pointer into libc. Pointers live in the
+  // writable data segment, so probe that first (the i32==0 candidates above are
+  // mostly padding in other segments), then fall back to them.
+  let chainHop = null;
+  const f = (n) => `0x${BigInt(n).toString(16)}`;
+  const rwMaps = JSON.parse(
+    (await callTool("list_maps", { pid, filter: "libc.so" }))
+      .result?.content?.[0]?.text || "[]",
+  ).filter((m) => m.perms.startsWith("rw"));
+  for (const seg of rwMaps) {
+    const start = BigInt(seg.start), end = BigInt(seg.end);
+    const addrs = [];
+    for (let at = start; at + 8n <= end && addrs.length < 512; at += 8n) addrs.push(f(at));
+    if (!addrs.length) continue;
+    const res = JSON.parse(
+      (await callTool("read_values", { pid, addresses: addrs, type: "u64" }))
+        .result?.content?.[0]?.text || "{}",
+    );
+    for (const [i, item] of (res.values || []).entries()) {
+      if (!item.readable) continue;
+      const ptr = BigInt(item.value);
+      if (ptr >= libBase && ptr < libEnd) {
+        chainHop = BigInt(addrs[i]) - libBase;
+        break;
+      }
+    }
+    if (chainHop !== null) break;
+  }
+  check("found a slot holding a module pointer", chainHop !== null);
+
+  if (chainHop) {
+    const chain = await callTool("pointer_chain", {
+      pid, base: "libc.so", rva: f(chainHop), offsets: [0, 8], type: "i32",
+    });
+    const chainText = chain.result?.content?.[0]?.text || "";
+    console.log("pointer_chain:", chainText.slice(0, 260));
+    const chainData = JSON.parse(chainText || "{}");
+    check("pointer_chain reports every hop", Array.isArray(chainData.steps) && chainData.steps.length >= 3);
+    check("pointer_chain resolves an address", typeof chainData.address === "string");
+    // The entry hop must be the requested slot and the final hop must be the
+    // dereferenced pointer plus the last offset.
+    const entry = BigInt(chainData.steps?.[0]?.addr ?? 0);
+    check("pointer_chain entry is base+rva", entry === libBase + BigInt(chainHop));
+    if (chainData.steps?.[1]?.pointer) {
+      check(
+        "pointer_chain final address equals pointer + last offset",
+        BigInt(chainData.steps[1].pointer) + 8n === BigInt(chainData.address),
+      );
+    }
+  }
+
+  console.log("\n=== 18. pointer_chain on an invalid base ===");
+  const badChain = JSON.parse(
+    (await callTool("pointer_chain", { pid, base: 0x10, rva: 0, offsets: [0, 8] }))
+      .result?.content?.[0]?.text || "{}",
+  );
+  check("pointer_chain fails cleanly", badChain.resolved === false && badChain.failed_step === 1);
+
+  console.log("\n=== 19. scan_rva ===");
+  const rva = await callTool("scan_rva", { pid, module: "libc.so", value: 0, type: "i32" });
+  const rvaText = rva.result?.content?.[0]?.text || "";
+  console.log("scan_rva:", rvaText.slice(0, 200));
+  const rvaData = JSON.parse(rvaText || "{}");
+  check("scan_rva reports rvas[]", Array.isArray(rvaData.rvas) && rvaData.rvas.length > 0);
+
+  console.log("\n=== 20. find_instructions ===");
+  const insn = await callTool("find_instructions", {
+    pid, pattern: "D65F03C0/FFFFFFFF", where: "libc.so", limit: 5,
+  });
+  const insnText = insn.result?.content?.[0]?.text || "";
+  console.log("find_instructions:", insnText.slice(0, 200));
+  const insnData = JSON.parse(insnText || "{}");
+  check("find_instructions finds RET", (insnData.count || 0) > 0);
+  check("find_instructions includes an RVA", typeof insnData.matches?.[0]?.rva === "string");
+
+  // --- Dump ---------------------------------------------------------------
+  console.log("\n=== 21. dump_memory ===");
+  const dumpPath = `/data/local/tmp/hmkpm-test-dump-${pid}.bin`;
+  const dump = await callTool("dump_memory", {
+    pid, target: "libc.so", size: "all", outPath: dumpPath,
+  });
+  const dumpText = dump.result?.content?.[0]?.text || "";
+  console.log("dump_memory:", dumpText);
+  const dumpData = JSON.parse(dumpText || "{}");
+  check("dump_memory writes bytes", (dumpData.bytes || 0) > 0);
+  check("dump_memory writes a sidecar", typeof dumpData.map_file === "string");
+
+  // --- Freeze -------------------------------------------------------------
+  // Freezing rewrites a slot continuously, so only run it against a throwaway
+  // process: HMKPM_TEST_WRITE_PID is started by the runner for exactly this.
+  console.log("\n=== 22. freeze_value ===");
+  if (!writePid) {
+    console.log("  SKIP: set HMKPM_TEST_WRITE_PID to a throwaway process to test freezing");
+  } else {
+    // Find a writable slot inside the throwaway process.
+    const slot = writeSlot || (await findSlot(writePid));
+    check("throwaway process has a writable slot", Boolean(slot));
+
+    if (slot) {
+      const fzData = JSON.parse(
+        (await callTool("freeze_value", {
+          pid: writePid, type: "i32", value: 4242, addresses: [slot], intervalMs: 30,
+        })).result?.content?.[0]?.text || "{}",
+      );
+      console.log("freeze_value:", JSON.stringify(fzData));
+      check("freeze_value starts a daemon", fzData.running === true);
+
+      // Overwrite behind the daemon's back, then confirm it wins the slot back.
+      await callTool("write_value", { pid: writePid, address: slot, type: "i32", value: 9 });
+      // On-device Node has no usable setTimeout/sleep shim; block briefly.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+      const held = JSON.parse(
+        (await callTool("read_value", { pid: writePid, address: slot, type: "i32" }))
+          .result?.content?.[0]?.text || "{}",
+      );
+      check("freeze_value holds the value after an overwrite", Number(held.value) === 4242);
+
+      console.log("\n=== 23. list_freezes ===");
+      const flist = JSON.parse(
+        (await callTool("list_freezes", { pid: writePid })).result?.content?.[0]?.text || "{}",
+      );
+      check("list_freezes reports the slot", (flist.count || 0) >= 1 && flist.running === "true");
+
+      console.log("\n=== 24. unfreeze_value ===");
+      const unfz = JSON.parse(
+        (await callTool("unfreeze_value", { pid: writePid })).result?.content?.[0]?.text || "{}",
+      );
+      check("unfreeze_value clears everything", unfz.cleared === true);
+      const flist2 = JSON.parse(
+        (await callTool("list_freezes", { pid: writePid })).result?.content?.[0]?.text || "{}",
+      );
+      check("daemon exits after unfreeze", flist2.running === "false" && flist2.count === 0);
+    }
+  }
 
   await finish();
 };

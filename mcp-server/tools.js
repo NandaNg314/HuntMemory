@@ -15,6 +15,18 @@ function assertType(t) {
   return t;
 }
 
+// Offsets in a pointer chain can be negative; represent them at full width so
+// the CLI's strtoll sees a plain signed value rather than a wrapped hex literal.
+function formatOffset(o) {
+  if (typeof o === "number") {
+    return o < 0 ? String(Math.trunc(o)) : `0x${Math.trunc(o).toString(16)}`;
+  }
+  const s = String(o).trim();
+  // "-0x40" is valid input from a caller; pass it through.
+  if (/^-?0x[0-9a-f]+$/i.test(s) || /^-?\d+$/.test(s)) return s;
+  throw new Error(`invalid offset "${o}" (use a number or hex string)`);
+}
+
 export class HmkpmTools {
   constructor(device) {
     this.device = device;
@@ -175,6 +187,68 @@ export class HmkpmTools {
     const args = ["module_base", String(pid), String(module)];
     if (rva !== undefined && rva !== null && rva !== "") args.push(asHex(rva));
     return this.device.invoke(args);
+  }
+
+  // Walk base+rva -> [off] -> [off] -> ... -> field. The final offset is added
+  // without dereferencing, which is the address the caller wants to read/write.
+  async pointerChain({ pid, base, rva, offsets = [], type = "i32" }) {
+    assertType(type);
+    if (!base) throw new Error("base must be a module name or an address");
+    const list = (Array.isArray(offsets) ? offsets : [offsets])
+      .filter((o) => o !== undefined && o !== null && o !== "");
+    const args = [
+      "pointer_chain", String(pid),
+      typeof base === "number" ? asHex(base) : String(base),
+      asHex(rva ?? 0), type,
+      ...list.map(formatOffset),
+    ];
+    return this.device.invoke(args);
+  }
+
+  // Freeze one or more addresses at a fixed value. Runs a detached daemon on
+  // the device that rewrites the slots continuously.
+  async freeze({ pid, type = "i32", value, addresses, intervalMs = 50 }) {
+    assertType(type);
+    const args = ["freeze_add", String(pid), type, formatValueForCli(type, value), String(intervalMs)];
+    for (const a of addresses ?? []) args.push(asHex(a));
+    return this.device.invoke(args);
+  }
+
+  async unfreeze({ pid, addresses }) {
+    const args = ["freeze_remove", String(pid)];
+    for (const a of addresses ?? []) args.push(asHex(a));
+    return this.device.invoke(args);
+  }
+
+  async freezeList({ pid }) {
+    return this.device.invoke(["freeze_list", String(pid)]);
+  }
+
+  // Stream a memory region to a file on the device.
+  async dump({ pid, target, size = "all", outPath, perms = "rw-p" }) {
+    if (!outPath) throw new Error("outPath is required (a path on the device)");
+    let what = String(target);
+    if (/^[0-9]/.test(what) || /^0x/i.test(what)) what = asHex(what);
+    else what = `module:${what}`;
+    return this.device.invoke([
+      "dump", String(pid), what, String(size), String(outPath), perms,
+    ]);
+  }
+
+  // Scan a single module and report module-relative offsets, which survive a
+  // process restart (absolute addresses do not).
+  async scanRva({ pid, module, value, type = "i32", align }) {
+    assertType(type);
+    const args = ["scan_rva", String(pid), String(module), type, formatValueForCli(type, value)];
+    if (align !== undefined && align !== null) args.push(String(align));
+    return this.device.invoke(args);
+  }
+
+  // ARM64 instruction pattern search over executable memory.
+  async findInstructions({ pid, pattern, where = "r-xp", limit = 100 }) {
+    return this.device.invoke([
+      "find_instructions", String(pid), String(pattern), String(where), String(limit),
+    ]);
   }
 }
 

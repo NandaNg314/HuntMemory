@@ -11,6 +11,9 @@
 #include <dirent.h>
 #include <math.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <time.h>
+#include <sys/mman.h>
 
 #define SYS_GETRESUID 148
 
@@ -93,6 +96,234 @@ static void print_error(const char *msg, int err) {
     printf("{\"status\":\"error\",\"message\":\"%s\",\"errno\":%d}\n", msg, err);
 }
 
+static int hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Raw process memory access.
+//
+// A single-address HMKPM_READ is unreliable: the kernel returns EFAULT both
+// when the target page is unreadable and when its copy_to_user cannot land in
+// our frame, so callers could not tell a real zero from a dropped read. Every
+// access therefore goes through a page-aligned span read, which only fails when
+// the target memory itself is unreadable. One page per syscall is also the
+// cheapest granularity: candidates from a scan are dense inside a mapping, so
+// one read serves every value that falls in that 4 KiB.
+// ---------------------------------------------------------------------------
+
+#define PAGE_SIZE_ 4096
+#define PAGE_MASK_ (~0xFFFULL)
+
+// Largest span we ask hmkpm to copy in one call. Bounded so a huge dump cannot
+// make the kernel allocate more than a few hundred KiB at a time.
+#define READ_SPAN_MAX (256 * 1024)
+
+// Read `size` bytes from `addr` into `out`. Returns true on success.
+//
+// The request is placed on the stack with its payload following immediately,
+// which is the layout hmkpm expects (struct hmkpm_req header, then the caller's
+// buffer). Reads that cross into an unreadable page are retried page by page so
+// a hole in the middle of a mapping does not lose the readable part around it.
+static bool raw_read(int pid, uint64_t addr, void *out, size_t size) {
+    if (size == 0) return true;
+    size_t cap = size < READ_SPAN_MAX ? size : READ_SPAN_MAX;
+    size_t total_len = sizeof(struct hmkpm_req) + cap;
+    uint8_t *buf = (uint8_t *)malloc(total_len);
+    if (!buf) return false;
+
+    struct hmkpm_req *req = (struct hmkpm_req *)buf;
+    uint8_t *data = buf + sizeof(struct hmkpm_req);
+    uint8_t *dst = (uint8_t *)out;
+
+    bool all_ok = true;
+    size_t done = 0;
+    while (done < size) {
+        size_t want = size - done;
+        if (want > cap) want = cap;
+        req->pid = pid;
+        req->addr = addr + done;
+        req->size = want;
+        errno = 0;
+        long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_READ, buf, sizeof(struct hmkpm_req) + want);
+        if (ret >= 0 || ret == 0) {
+            memcpy(dst + done, data, want);
+            done += want;
+            continue;
+        }
+        if (want == 1) {
+            // A single unreadable byte: nothing to narrow.
+            ((uint8_t *)out)[done] = 0;
+            all_ok = false;
+            done += 1;
+            continue;
+        }
+        // Failed. Narrow to a single page and retry; if a lone page fails, the
+        // target memory is genuinely unreadable there and we leave it zeroed.
+        if (want > PAGE_SIZE_) {
+            want = PAGE_SIZE_;
+            req->pid = pid;
+            req->addr = addr + done;
+            req->size = want;
+            errno = 0;
+            ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_READ, buf, sizeof(struct hmkpm_req) + want);
+
+            if (ret >= 0 || ret == 0) {
+                memcpy(dst + done, data, want);
+                done += want;
+                continue;
+            }
+            want = PAGE_SIZE_;
+        }
+        memset(dst + done, 0, want);
+        all_ok = false;
+        done += want;
+    }
+    free(buf);
+    return all_ok;
+}
+
+// Read a single value of `size` bytes (1-8). Returns false when unreadable.
+static bool raw_read_exact(int pid, uint64_t addr, void *out, size_t size) {
+    // Prefer the value alone, but fall back to a full page-aligned span so a
+    // page whose head is unmapped still yields the bytes that do exist.
+    if (raw_read(pid, addr, out, size)) return true;
+
+    uint64_t page = addr & PAGE_MASK_;
+    size_t off = (size_t)(addr - page);
+    if (off + size > PAGE_SIZE_) return false;
+    uint8_t *span = (uint8_t *)malloc(PAGE_SIZE_);
+    if (!span) return false;
+    bool ok = raw_read(pid, page, span, PAGE_SIZE_);
+    if (ok) memcpy(out, span + off, size);
+    free(span);
+    return ok;
+}
+
+// Write `size` bytes at `addr`. Returns the errno-style failure code, 0 on
+// success. Writing has no page-aligned workaround: hmkpm copies straight from
+// our buffer into the target, so the request either lands or it does not.
+static int raw_write(int pid, uint64_t addr, const void *src, size_t size) {
+    size_t total_len = sizeof(struct hmkpm_req) + size;
+    uint8_t *buf = (uint8_t *)malloc(total_len);
+    if (!buf) return ENOMEM;
+    struct hmkpm_req *req = (struct hmkpm_req *)buf;
+    req->pid = pid;
+    req->addr = addr;
+    req->size = size;
+    memcpy(buf + sizeof(struct hmkpm_req), src, size);
+    errno = 0;
+    long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_WRITE, buf, total_len);
+    int err = (ret < 0 && ret != 0) ? (errno ? errno : EFAULT) : 0;
+    free(buf);
+    return err;
+}
+
+// ---------------------------------------------------------------------------
+// Parsed /proc/<pid>/maps, shared by every command that needs VMA topology
+// (range collection, module lookup, RVA resolution, dumps).
+// ---------------------------------------------------------------------------
+
+struct vma {
+    uint64_t start;
+    uint64_t end;
+    uint64_t offset;
+    char     perms[5];
+    char     path[256];
+};
+
+struct vma_table {
+    struct vma *items;
+    uint32_t    count;
+};
+
+static void vma_table_free(struct vma_table *t) {
+    if (t) {
+        free(t->items);
+        t->items = NULL;
+        t->count = 0;
+    }
+}
+
+// Parse the maps file once. Returns false only when the file is unreadable
+// (a dead pid), so callers can distinguish "no matches" from "no process".
+static bool vma_table_load(int pid, struct vma_table *out) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+
+    uint32_t cap = 512;
+    uint32_t n = 0;
+    struct vma *items = (struct vma *)malloc(sizeof(struct vma) * cap);
+    if (!items) { fclose(f); return false; }
+
+    char line[600];
+    while (fgets(line, sizeof(line), f)) {
+        uint64_t start = 0, end = 0, offset = 0;
+        char perms[8] = {0}, dev[16] = {0}, pathname[300] = {0};
+        unsigned long inode = 0;
+        // pathname is optional (anonymous mappings have none).
+        int c = sscanf(line, "%llx-%llx %7s %llx %15s %lu %299[^\n]",
+                       (unsigned long long *)&start, (unsigned long long *)&end,
+                       perms, (unsigned long long *)&offset, dev, &inode, pathname);
+        if (c < 5) continue;
+
+        if (n == cap) {
+            cap *= 2;
+            struct vma *grown = (struct vma *)realloc(items, sizeof(struct vma) * cap);
+            if (!grown) { free(items); fclose(f); return false; }
+            items = grown;
+        }
+        struct vma *v = &items[n++];
+        v->start = start;
+        v->end = end;
+        v->offset = offset;
+        memcpy(v->perms, perms, 4);
+        v->perms[4] = '\0';
+        v->path[0] = '\0';
+        if (c >= 7 && pathname[0]) {
+            char *name = pathname;
+            while (*name == ' ') name++;
+            // Paths are already bounded; reject control characters so the JSON
+            // we emit downstream stays valid.
+            size_t k = 0;
+            for (; name[k] && k < sizeof(v->path) - 1; k++) {
+                unsigned char ch = (unsigned char)name[k];
+                v->path[k] = (ch < 32 || ch == 127) ? ' ' : (char)ch;
+            }
+            v->path[k] = '\0';
+            // Trailing whitespace / CR would break comparisons with a caller's
+            // module name, so trim it.
+            while (k > 0 && (v->path[k - 1] == ' ' || v->path[k - 1] == '\r')) {
+                v->path[--k] = '\0';
+            }
+        }
+    }
+    fclose(f);
+    out->items = items;
+    out->count = n;
+    return true;
+}
+
+// True when `perms` satisfies a filter such as "rw-p". The filter is a
+// substring match, matching the historical behaviour of `maps [filter]`,
+// but the leading 'r' is always required: hmkpm cannot read unreadable pages.
+static bool perms_match(const char *perms, const char *filter) {
+    if (perms[0] != 'r') return false;
+    if (!filter || !*filter) return true;
+    return strstr(perms, filter) != NULL;
+}
+
+// The leaf name of a mapping path ("/apex/.../libc.so" -> "libc.so").
+static const char *vma_leaf(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
 static uint32_t collect_ranges(int pid, const char *perm_req,
                                struct hmkpm_scan_range *ranges, uint32_t max_ranges);
 
@@ -129,27 +360,22 @@ static int cmd_read(int pid, uint64_t addr, size_t size) {
         print_error("Invalid size (max 16MB)", EINVAL);
         return 1;
     }
-    size_t total_len = sizeof(struct hmkpm_req) + size;
-    uint8_t *buf = (uint8_t *)calloc(1, total_len);
-    if (!buf) {
+    uint8_t *data = (uint8_t *)malloc(size);
+    if (!data) {
         print_error("Out of memory", ENOMEM);
         return 1;
     }
-
-    struct hmkpm_req *req = (struct hmkpm_req *)buf;
-    req->pid = pid;
-    req->addr = addr;
-    req->size = size;
-
-    errno = 0;
-    long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_READ, buf, total_len);
-    if (ret < 0 && ret != 0) {
-        print_error("HMKPM read failed", errno ? errno : EFAULT);
-        free(buf);
-        return 1;
+    if (!raw_read(pid, addr, data, size)) {
+        // A span with a hole in it still yields whatever pages were readable;
+        // report the failure but emit those bytes rather than nothing.
+        printf("{\"status\":\"partial\",\"pid\":%d,\"addr\":\"0x%llx\",\"size\":%zu,\"hex\":\"",
+               pid, (unsigned long long)addr, size);
+        for (size_t i = 0; i < size; i++) printf("%02x", data[i]);
+        printf("\"}\n");
+        free(data);
+        return 0;
     }
 
-    uint8_t *data = buf + sizeof(struct hmkpm_req);
     printf("{\"status\":\"ok\",\"pid\":%d,\"addr\":\"0x%llx\",\"size\":%zu,\"hex\":\"",
            pid, (unsigned long long)addr, size);
     for (size_t i = 0; i < size; i++) {
@@ -165,7 +391,7 @@ static int cmd_read(int pid, uint64_t addr, size_t size) {
         }
     }
     printf("\"}\n");
-    free(buf);
+    free(data);
     return 0;
 }
 
@@ -176,40 +402,32 @@ static int cmd_write(int pid, uint64_t addr, const char *hex_str) {
         return 1;
     }
     size_t size = hex_len / 2;
-    size_t total_len = sizeof(struct hmkpm_req) + size;
-    uint8_t *buf = (uint8_t *)calloc(1, total_len);
-    if (!buf) {
+    uint8_t *data = (uint8_t *)malloc(size);
+    if (!data) {
         print_error("Out of memory", ENOMEM);
         return 1;
     }
 
-    struct hmkpm_req *req = (struct hmkpm_req *)buf;
-    req->pid = pid;
-    req->addr = addr;
-    req->size = size;
-
-    uint8_t *data = buf + sizeof(struct hmkpm_req);
     for (size_t i = 0; i < size; i++) {
-        unsigned int byte_val;
-        if (sscanf(hex_str + 2 * i, "%02x", &byte_val) != 1) {
+        int hi = hex_digit(hex_str[2 * i]);
+        int lo = hex_digit(hex_str[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
             print_error("Invalid hex digit", EINVAL);
-            free(buf);
+            free(data);
             return 1;
         }
-        data[i] = (uint8_t)byte_val;
+        data[i] = (uint8_t)((hi << 4) | lo);
     }
 
-    errno = 0;
-    long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_WRITE, buf, total_len);
-    if (ret < 0 && ret != 0) {
-        print_error("HMKPM write failed", errno ? errno : EFAULT);
-        free(buf);
+    int err = raw_write(pid, addr, data, size);
+    free(data);
+    if (err) {
+        print_error("HMKPM write failed", err);
         return 1;
     }
 
     printf("{\"status\":\"ok\",\"pid\":%d,\"addr\":\"0x%llx\",\"bytes_written\":%zu}\n",
            pid, (unsigned long long)addr, size);
-    free(buf);
     return 0;
 }
 
@@ -224,22 +442,13 @@ static int cmd_read_val(int pid, uint64_t addr, const char *type_name) {
         return 1;
     }
 
-    size_t total_len = sizeof(struct hmkpm_req) + sz;
-    uint8_t *buf = (uint8_t *)calloc(1, total_len);
-    struct hmkpm_req *req = (struct hmkpm_req *)buf;
-    req->pid = pid;
-    req->addr = addr;
-    req->size = sz;
-
-    errno = 0;
-    long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_READ, buf, total_len);
-    if (ret < 0 && ret != 0) {
-        print_error("HMKPM read failed", errno ? errno : EFAULT);
-        free(buf);
+    uint8_t value[8] = {0};
+    if (!raw_read_exact(pid, addr, value, sz)) {
+        print_error("HMKPM read failed (address not readable)", EFAULT);
         return 1;
     }
 
-    uint8_t *data = buf + sizeof(struct hmkpm_req);
+    const uint8_t *data = value;
     printf("{\"status\":\"ok\",\"pid\":%d,\"addr\":\"0x%llx\",\"type\":\"%s\",",
            pid, (unsigned long long)addr, type_name);
 
@@ -265,7 +474,6 @@ static int cmd_read_val(int pid, uint64_t addr, const char *type_name) {
         printf("\"value\":%g", *(double *)data);
     }
     printf("}\n");
-    free(buf);
     return 0;
 }
 
@@ -298,25 +506,14 @@ static int cmd_write_val(int pid, uint64_t addr, const char *type_name, const ch
         return 1;
     }
 
-    size_t total_len = sizeof(struct hmkpm_req) + sz;
-    uint8_t *buf = (uint8_t *)calloc(1, total_len);
-    struct hmkpm_req *req = (struct hmkpm_req *)buf;
-    req->pid = pid;
-    req->addr = addr;
-    req->size = sz;
-    memcpy(buf + sizeof(struct hmkpm_req), raw, sz);
-
-    errno = 0;
-    long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_WRITE, buf, total_len);
-    if (ret < 0 && ret != 0) {
-        print_error("HMKPM write failed", errno ? errno : EFAULT);
-        free(buf);
+    int err = raw_write(pid, addr, raw, sz);
+    if (err) {
+        print_error("HMKPM write failed", err);
         return 1;
     }
 
     printf("{\"status\":\"ok\",\"pid\":%d,\"addr\":\"0x%llx\",\"type\":\"%s\",\"value\":\"%s\"}\n",
            pid, (unsigned long long)addr, type_name, val_str);
-    free(buf);
     return 0;
 }
 
@@ -515,12 +712,21 @@ static bool kernel_scan_ranges(int pid, uint8_t type, uint8_t align, uint64_t cr
         }
 
         uint64_t hits = hdr->matches_found;
-        *found_out += hits;
         uint64_t *src = (uint64_t *)slot_base;
         uint32_t take = hits > slot_cap ? slot_cap : (uint32_t)hits;
+        uint32_t usable = 0;
         for (uint32_t i = 0; i < take && *reported_out < cap; i++) {
+            // Address 0 is never a real hit (no process maps page 0). A
+            // truncated scan against a small process has been observed to
+            // report its hits as 0x0, and a caller that trusts such an address
+            // would write into the target's null page, so drop it.
+            if (src[i] == 0) continue;
             (*matches_out)[(*reported_out)++] = src[i];
+            usable++;
         }
+        // Count only hits we can actually report. The raw kernel count is
+        // meaningless when the slot array was filled with unusable entries.
+        *found_out += usable > 0 ? (hits > slot_cap ? hits : usable) : 0;
         done += n;
         batch = KERNEL_RANGE_BATCH;            // restore full batch on success
     }
@@ -774,6 +980,24 @@ static void session_free(struct scan_session *s) {
 //
 // `live` (optional) marks the slots the kernel actually returned so callers can
 // distinguish a real zero from a dropped slot.
+struct page_candidates {
+    uint64_t addr;
+    uint32_t idx;
+};
+
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
+
+static int cmp_page_candidates(const void *a, const void *b) {
+    const struct page_candidates *x = (const struct page_candidates *)a;
+    const struct page_candidates *y = (const struct page_candidates *)b;
+    if (x->addr < y->addr) return -1;
+    if (x->addr > y->addr) return 1;
+    return 0;
+}
+
 static void read_many(int pid, const uint64_t *addrs, uint32_t n, uint8_t size,
                       uint8_t *out, uint32_t *ok_count, uint8_t *live) {
     *ok_count = 0;
@@ -828,68 +1052,106 @@ static void read_many(int pid, const uint64_t *addrs, uint32_t n, uint8_t size,
     }
 }
 
+// Same as read_many, but order-independent: candidates are bucketed by page
+// first, so callers whose address list is not sorted (the kernel's batched scan
+// concatenates per-batch lists, which are each sorted but not jointly) still
+// get exact values. read_many's inner loop assumes ascending addresses, so
+// anything that is not guaranteed sorted must come through here.
+#define HMKPM_PUBLIC_API 1
+void read_many_unsorted(int pid, const uint64_t *addrs, uint32_t n, uint8_t size,
+                        uint8_t *out, uint32_t *ok_count, uint8_t *live) {
+    *ok_count = 0;
+    if (live) memset(live, 0, n);
+    if (n == 0) return;
+
+    // Sort (address, original index) pairs so identical pages are adjacent, run
+    // the sorted path over a shadow copy, then scatter the results back.
+    struct page_candidates *pairs =
+        (struct page_candidates *)malloc(sizeof(struct page_candidates) * n);
+    uint64_t *sorted = (uint64_t *)malloc(sizeof(uint64_t) * n);
+    uint8_t *mid_out = (uint8_t *)malloc((size_t)n * size);
+    uint8_t *mid_live = (uint8_t *)malloc(n);
+    if (!pairs || !sorted || !mid_out || !mid_live) {
+        free(pairs); free(sorted); free(mid_out); free(mid_live);
+        memset(out, 0, (size_t)n * size);
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) { pairs[i].addr = addrs[i]; pairs[i].idx = i; }
+    qsort(pairs, n, sizeof(struct page_candidates), cmp_page_candidates);
+    for (uint32_t i = 0; i < n; i++) sorted[i] = pairs[i].addr;
+
+    uint32_t ok_mid = 0;
+    read_many(pid, sorted, n, size, mid_out, &ok_mid, mid_live);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t dst = pairs[i].idx;
+        memcpy(out + (size_t)dst * size, mid_out + (size_t)i * size, size);
+        if (live) live[dst] = mid_live[i];
+        if (mid_live[i]) (*ok_count)++;
+    }
+
+    free(pairs); free(sorted); free(mid_out); free(mid_live);
+}
+
 // Collect readable ranges (matches the semantics used by cmd_scan).
 // `max_ranges` caps the returned count; pass 0 for "as many as fit".
 // A large app (systemui) has ~1600 rw-p VMAs, so the old fixed 1024-slot
 // stack array silently skipped a third of the address space.
 static uint32_t collect_ranges(int pid, const char *perm_req,
                                struct hmkpm_scan_range *ranges, uint32_t max_ranges) {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    char line[512];
-    uint32_t range_count = 0;
-    const char *pr = perm_req ? perm_req : "rw-p";
-    while (fgets(line, sizeof(line), f)) {
-        if (max_ranges && range_count >= max_ranges) break;
-        uint64_t start = 0, end = 0;
-        char perms[8] = {0};
-        int c = sscanf(line, "%llx-%llx %7s", (unsigned long long *)&start, (unsigned long long *)&end, perms);
-        if (c >= 3) {
-            if (perms[0] == 'r' && (!perm_req || strstr(perms, pr))) {
-                ranges[range_count].start_va = start;
-                ranges[range_count].size = end - start;
-                range_count++;
-            }
-        }
+    struct vma_table t;
+    if (!vma_table_load(pid, &t)) return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < t.count; i++) {
+        if (max_ranges && n >= max_ranges) break;
+        if (!perms_match(t.items[i].perms, perm_req)) continue;
+        ranges[n].start_va = t.items[i].start;
+        ranges[n].size = t.items[i].end - t.items[i].start;
+        n++;
     }
-    fclose(f);
-    return range_count;
+    vma_table_free(&t);
+    return n;
 }
 
 // Count how many VMAs match, without storing them, so callers can allocate the
 // exact number of slots instead of guessing a cap.
 static uint32_t count_ranges(int pid, const char *perm_req) {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    char line[512];
+    struct vma_table t;
+    if (!vma_table_load(pid, &t)) return 0;
     uint32_t n = 0;
-    const char *pr = perm_req ? perm_req : "rw-p";
-    while (fgets(line, sizeof(line), f)) {
-        uint64_t start = 0, end = 0;
-        char perms[8] = {0};
-        if (sscanf(line, "%llx-%llx %7s", (unsigned long long *)&start, (unsigned long long *)&end, perms) >= 3) {
-            if (perms[0] == 'r' && (!perm_req || strstr(perms, pr))) n++;
-        }
+    for (uint32_t i = 0; i < t.count; i++) {
+        if (perms_match(t.items[i].perms, perm_req)) n++;
     }
-    fclose(f);
+    vma_table_free(&t);
     return n;
 }
 
-// Allocate a range array sized to the process's actual VMA count and fill it.
-// Returns NULL when the process has no matching mapping.
+// Allocate a range array sized to the process's actual VMA count and fill it in
+// a single maps parse. Returns NULL when the process has no matching mapping.
 static struct hmkpm_scan_range *collect_ranges_alloc(int pid, const char *perm_req,
                                                      uint32_t *count_out) {
     *count_out = 0;
-    uint32_t n = count_ranges(pid, perm_req);
-    if (n == 0) return NULL;
+    struct vma_table t;
+    if (!vma_table_load(pid, &t)) return NULL;
+
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < t.count; i++) {
+        if (perms_match(t.items[i].perms, perm_req)) n++;
+    }
+    if (n == 0) { vma_table_free(&t); return NULL; }
+
     struct hmkpm_scan_range *ranges =
         (struct hmkpm_scan_range *)malloc(sizeof(struct hmkpm_scan_range) * n);
-    if (!ranges) return NULL;
-    *count_out = collect_ranges(pid, perm_req, ranges, n);
+    if (!ranges) { vma_table_free(&t); return NULL; }
+
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < t.count; i++) {
+        if (!perms_match(t.items[i].perms, perm_req)) continue;
+        ranges[k].start_va = t.items[i].start;
+        ranges[k].size = t.items[i].end - t.items[i].start;
+        k++;
+    }
+    vma_table_free(&t);
+    *count_out = k;
     return ranges;
 }
 
@@ -1116,9 +1378,12 @@ static int cmd_scan_seed(int pid, const char *type_name, const char *val_str, in
     uint64_t kept = found < cap ? found : cap;
 
     // Everything the kernel matched holds `criteria_val`, so the hit list *is*
-    // the baseline. Re-reading each hit is unnecessary (and a single-address
-    // HMKPM read is unreliable: it returns EFAULT even for readable pages
-    // because the kernel cannot copy into our frame).
+    // the baseline -- no re-read needed. But the hits arrive per batch, so they
+    // are not jointly sorted, and later passes rely on ascending addresses for
+    // their per-page reads. Sort once here (O(n log n) on an in-memory array is
+    // free next to the scan itself) and dedupe overlapping batch boundaries.
+    qsort(matches, (size_t)reported, sizeof(uint64_t), cmp_u64);
+
     struct scan_session sess;
     sess.pid = pid;
     sess.type = type;
@@ -1126,7 +1391,9 @@ static int cmd_scan_seed(int pid, const char *type_name, const char *val_str, in
     sess.count = 0;
     sess.entries = (struct scan_entry *)malloc(sizeof(struct scan_entry) * (kept ? kept : 1));
     if (!sess.entries) { print_error("Out of memory", ENOMEM); free(matches); return 1; }
-    for (uint64_t i = 0; i < kept; i++) {
+    for (uint32_t i = 0; i < reported && sess.count < kept; i++) {
+        if (matches[i] == 0) continue;
+        if (sess.count > 0 && sess.entries[sess.count - 1].addr == matches[i]) continue;
         struct scan_entry *e = &sess.entries[sess.count];
         e->addr = matches[i];
         e->val.u = 0;
@@ -1401,42 +1668,890 @@ static int cmd_find_string(int pid, const char *needle, const char *filter_perms
     return 0;
 }
 
+// Largest legal address the process can hold. Anything above this is not a
+// pointer, so a chain walk stops rather than chasing an integer that happens to
+// look like one.
+#define USER_ADDR_MAX  ((uint64_t)1 << 48)
+
+// Find the module whose leaf name matches and return its load base, span and
+// VMA count. Module leaves collide across app/lib/system dirs, so the caller
+// passes an optional path fragment to disambiguate when needed.
+static bool module_lookup(struct vma_table *t, const char *module,
+                          uint64_t *base_out, uint64_t *span_end_out, uint32_t *vma_count) {
+    uint64_t best = 0, end = 0;
+    uint32_t hits = 0;
+    for (uint32_t i = 0; i < t->count; i++) {
+        const char *leaf = vma_leaf(t->items[i].path);
+        if (!leaf[0] || strcmp(leaf, module) != 0) continue;
+        hits++;
+        // The mapping with file offset 0 is the module's true load address;
+        // without one, fall back to the lowest VMA that carries the name.
+        if (t->items[i].offset == 0 && t->items[i].start != 0) {
+            best = t->items[i].start;
+            end = t->items[i].end;
+        } else if (!best || t->items[i].start < best) {
+            best = t->items[i].start;
+            end = t->items[i].end;
+        } else if (t->items[i].end > end) {
+            end = t->items[i].end;
+        }
+    }
+    *base_out = best;
+    *span_end_out = end;
+    *vma_count = hits;
+    return hits > 0;
+}
+
 // Resolve the load base of a module (e.g. libil2cpp.so) and optionally add an
 // RVA, which is how every pointer chain in a game actually starts.
 // argv: module_base <pid> <module> [rva]
 static int cmd_module_base(int pid, const char *module, const char *rva_str) {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    struct vma_table t;
+    if (!vma_table_load(pid, &t)) { print_error("Cannot read maps", errno); return 1; }
+
+    uint64_t base = 0, end = 0, rva = rva_str ? strtoull(rva_str, NULL, 0) : 0;
+    uint32_t vma_count = 0;
+    bool found = module_lookup(&t, module, &base, &end, &vma_count);
+    vma_table_free(&t);
+
+    if (!found) { print_error("Module not mapped in this process", ENOENT); return 1; }
+    printf("{\"status\":\"ok\",\"pid\":%d,\"module\":\"%s\",\"base\":\"0x%llx\",\"rva\":\"0x%llx\","
+           "\"address\":\"0x%llx\",\"module_end\":\"0x%llx\",\"vmas\":%u}\n",
+           pid, module, (unsigned long long)base, (unsigned long long)rva,
+           (unsigned long long)(base + rva), (unsigned long long)end, vma_count);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Pointer chain resolution.
+//
+// A game address is never absolute across launches: it is
+//   base + rva  ->  [ + off1 ]  ->  [ + off2 ]  -> ...  -> final address
+// where the first hop lives inside a module (stable RVA) and each following hop
+// is a pointer read from the target plus a fixed offset. Resolving the chain in
+// one CLI call avoids a process spawn and a round trip per hop, which is what
+// makes this usable interactively.
+// ---------------------------------------------------------------------------
+
+// Read a 64-bit pointer at `addr`. Returns false when the memory is unreadable
+// or the value cannot be a userspace pointer.
+static bool read_pointer(int pid, uint64_t addr, uint64_t *out) {
+    uint8_t buf[8];
+    if (!raw_read_exact(pid, addr, buf, 8)) return false;
+    uint64_t v;
+    memcpy(&v, buf, 8);
+    if (v == 0 || v >= USER_ADDR_MAX) return false;
+    *out = v;
+    return true;
+}
+
+// Walk a chain. `base` may be a module name (resolved inside the CLI) or an
+// absolute address supplied by the caller. `offsets` are applied as
+// read(ptr + off) then dereference, except the LAST offset which is added
+// without dereferencing -- that is the final field address the caller wants.
+//
+// argv: pointer_chain <pid> <base_module|0xaddr> <rva> <type> [off ...]
+static int cmd_pointer_chain(int pid, const char *base_arg, const char *rva_str,
+                             const char *type_name, int off_count, char **off_args) {
+    uint8_t elem_size = 4, align = 4;
+    uint8_t type = scan_type_from_name(type_name, &elem_size, &align);
+    if (type == 0) { print_error("Invalid type", EINVAL); return 1; }
+
+    uint64_t cur = 0;
+    char module_echo[256] = {0};
+    if (base_arg[0] >= '0' && base_arg[0] <= '9') {
+        cur = strtoull(base_arg, NULL, 0);
+    } else {
+        struct vma_table t;
+        if (!vma_table_load(pid, &t)) { print_error("Cannot read maps", errno); return 1; }
+        uint64_t base = 0, end = 0;
+        uint32_t vma_count = 0;
+        bool found = module_lookup(&t, base_arg, &base, &end, &vma_count);
+        vma_table_free(&t);
+        if (!found) { print_error("Module not mapped in this process", ENOENT); return 1; }
+        cur = base;
+        snprintf(module_echo, sizeof(module_echo), "%s", base_arg);
+    }
+
+    uint64_t rva = rva_str ? strtoull(rva_str, NULL, 0) : 0;
+    cur += rva;
+
+    printf("{\"status\":\"ok\",\"pid\":%d,\"module\":\"%s\",\"rva\":\"0x%llx\",\"steps\":[",
+           pid, module_echo, (unsigned long long)rva);
+
+    bool ok = true;
+    int  fail_step = -1;
+    /* hop 0 is the entry address itself */ {
+        printf("{\"step\":0,\"addr\":\"0x%llx\"}", (unsigned long long)cur);
+    }
+
+    for (int i = 0; i < off_count && ok; i++) {
+        int64_t off = (int64_t)strtoll(off_args[i], NULL, 0);
+        uint64_t at = (uint64_t)((int64_t)cur + off);
+        bool last = (i == off_count - 1);
+
+        if (last) {
+            cur = at;                          // final field address, no deref
+            printf(",{\"step\":%d,\"offset\":\"%s\",\"addr\":\"0x%llx\",\"final\":true}",
+                   i + 1, off_args[i], (unsigned long long)cur);
+            break;
+        }
+
+        uint64_t ptr = 0;
+        if (!read_pointer(pid, at, &ptr)) {
+            ok = false;
+            fail_step = i + 1;
+            printf(",{\"step\":%d,\"offset\":\"%s\",\"addr\":\"0x%llx\",\"error\":\"pointer unreadable or invalid\"}",
+                   i + 1, off_args[i], (unsigned long long)at);
+            break;
+        }
+        cur = ptr;
+        printf(",{\"step\":%d,\"offset\":\"%s\",\"addr\":\"0x%llx\",\"pointer\":\"0x%llx\"}",
+               i + 1, off_args[i], (unsigned long long)at, (unsigned long long)ptr);
+    }
+
+    if (!ok) {
+        printf("],\"resolved\":false,\"failed_step\":%d}\n", fail_step);
+        return 0;
+    }
+
+    // With no offsets at all the chain IS the address; resolve its value.
+    printf("],\"resolved\":true,\"address\":\"0x%llx\",\"type\":\"%s\"",
+           (unsigned long long)cur, type_name);
+
+    uint8_t raw[8] = {0};
+    if (raw_read_exact(pid, cur, raw, elem_size)) {
+        struct scan_entry e;
+        e.addr = cur;
+        decode_value(&e, type, raw);
+        printf(",\"readable\":true,\"value\":");
+        if (scan_type_is_float(type)) {
+            printf("%.9g", e.val.f);
+        } else if (type == HMKPM_SCAN_TYPE_U64 || type == HMKPM_SCAN_TYPE_U32 ||
+                   type == HMKPM_SCAN_TYPE_U16 || type == HMKPM_SCAN_TYPE_U8) {
+            printf("%llu", (unsigned long long)e.val.u);
+        } else {
+            printf("%lld", (long long)e.val.i);
+        }
+    } else {
+        printf(",\"readable\":false");
+    }
+    printf("}\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Value freezing.
+//
+// A frozen value has to be rewritten continuously: the app overwrites the slot
+// on its next frame, so a one-shot write is useless. The CLI itself is a
+// one-shot process, so freezing runs in a detached daemon (this same binary
+// re-executed with the internal `_freeze_daemon` command and its own session).
+// Writing requires no read, so the daemon only needs HMKPM_WRITE per slot, and
+// a single write per slot per tick is enough to win against any game loop.
+// ---------------------------------------------------------------------------
+
+#define FREEZE_STATE_DIR_DEFAULT "/data/local/tmp"
+#define FREEZE_MAX_SLOTS 256
+
+struct freeze_slot {
+    uint64_t addr;
+    uint8_t  data[8];
+    uint8_t  size;
+};
+
+// "<dir>/.hmkpm_freeze_<pid>.bin" -- one daemon per target process, so two
+// freezes on different apps can coexist.
+static void freeze_path(char *out, size_t out_sz, int pid, const char *suffix) {
+    const char *dir = getenv("HMKPM_SESSION_DIR");
+    if (!dir || !*dir) dir = FREEZE_STATE_DIR_DEFAULT;
+    snprintf(out, out_sz, "%s/.hmkpm_freeze_%d%s", dir, pid, suffix);
+}
+
+// The daemon's own record: it needs a pid file so `freeze_stop` can signal it
+// and `freeze_list` can report liveness without scanning /proc.
+static void freeze_pid_path(char *out, size_t out_sz, int pid) {
+    freeze_path(out, out_sz, pid, ".pid");
+}
+
+static int freeze_state_path(char *out, size_t out_sz, int pid) {
+    freeze_path(out, out_sz, pid, ".bin");
+    return 0;
+}
+
+static int freeze_save_slots(int pid, const struct freeze_slot *slots, uint32_t n) {
+    char path[256];
+    freeze_state_path(path, sizeof(path), pid);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    struct { int32_t pid; uint32_t count; } hdr = { pid, n };
+    bool ok = write(fd, &hdr, sizeof(hdr)) == (ssize_t)sizeof(hdr);
+    if (ok && n > 0) {
+        ok = write(fd, slots, sizeof(struct freeze_slot) * n) ==
+             (ssize_t)(sizeof(struct freeze_slot) * n);
+    }
+    close(fd);
+    return ok ? 0 : -1;
+}
+
+static int freeze_load_slots(int pid, struct freeze_slot *slots, uint32_t max, uint32_t *n_out) {
+    char path[256];
+    freeze_state_path(path, sizeof(path), pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    struct { int32_t pid; uint32_t count; } hdr;
+    if (read(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr) || hdr.count > max) {
+        close(fd);
+        return -1;
+    }
+    *n_out = hdr.count;
+    if (hdr.count > 0) {
+        size_t want = sizeof(struct freeze_slot) * hdr.count;
+        if (read(fd, slots, want) != (ssize_t)want) { close(fd); return -1; }
+    }
+    close(fd);
+    return 0;
+}
+
+// Internal command: `helpers _freeze_daemon <pid> <interval_ms>`.
+// Never prints to stdout (its parent is gone); it just keeps writing.
+static int cmd_freeze_daemon(int pid, int interval_ms, const char *self_path) {
+    // Detach from the caller's session so a closed MCP transport or a killed
+    // shell does not take the daemon down with it.
+    setsid();
+
+    char pid_path[256];
+    freeze_pid_path(pid_path, sizeof(pid_path), pid);
+    int pfd = open(pid_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (pfd >= 0) {
+        char buf[32];
+        int n = snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
+        if (write(pfd, buf, (size_t)n) != n) { /* best effort */ }
+        close(pfd);
+    }
+
+    struct freeze_slot slots[FREEZE_MAX_SLOTS];
+    uint32_t n = 0;
+    if (freeze_load_slots(pid, slots, FREEZE_MAX_SLOTS, &n) != 0) return 1;
+
+    if (interval_ms < 10) interval_ms = 10;
+    if (interval_ms > 2000) interval_ms = 2000;
+    struct timespec ts = { interval_ms / 1000, (long)(interval_ms % 1000) * 1000000L };
+
+    // Exit conditions: our pid file vanished (freeze_stop), the state file was
+    // removed, or the target process died. Checking all three keeps a stale
+    // daemon from spinning on a dead pid forever.
+    for (;;) {
+        if (kill(pid, 0) != 0) break;
+
+        // Re-read the slot table each tick so `freeze_add` takes effect without
+        // restarting the daemon, and a `freeze_remove` of the last slot ends it.
+        uint32_t cur_n = 0;
+        struct freeze_slot cur[FREEZE_MAX_SLOTS];
+        if (freeze_load_slots(pid, cur, FREEZE_MAX_SLOTS, &cur_n) != 0) break;
+        if (cur_n == 0) break;
+
+        for (uint32_t i = 0; i < cur_n; i++) {
+            raw_write(pid, cur[i].addr, cur[i].data, cur[i].size);
+        }
+        nanosleep(&ts, NULL);
+    }
+
+    // Clean up our own bookkeeping: state file and pid file both go away.
+    unlink(pid_path);
+    char state[256];
+    freeze_state_path(state, sizeof(state), pid);
+    unlink(state);
+    (void)self_path;
+    return 0;
+}
+
+static bool pid_alive(int pid) {
+    return pid > 0 && kill(pid, 0) == 0;
+}
+
+// Parse a typed value the same way write_val does, into `data`/`size`.
+static bool parse_typed_value(const char *type_name, const char *val_str,
+                              uint8_t *data, uint8_t *size_out) {
+    memset(data, 0, 8);
+    if (strcmp(type_name, "i8") == 0) { *size_out = 1; *(int8_t *)data = (int8_t)strtol(val_str, NULL, 0); }
+    else if (strcmp(type_name, "u8") == 0) { *size_out = 1; *(uint8_t *)data = (uint8_t)strtoul(val_str, NULL, 0); }
+    else if (strcmp(type_name, "i16") == 0) { *size_out = 2; *(int16_t *)data = (int16_t)strtol(val_str, NULL, 0); }
+    else if (strcmp(type_name, "u16") == 0) { *size_out = 2; *(uint16_t *)data = (uint16_t)strtoul(val_str, NULL, 0); }
+    else if (strcmp(type_name, "i32") == 0) { *size_out = 4; *(int32_t *)data = (int32_t)strtol(val_str, NULL, 0); }
+    else if (strcmp(type_name, "u32") == 0) { *size_out = 4; *(uint32_t *)data = (uint32_t)strtoul(val_str, NULL, 0); }
+    else if (strcmp(type_name, "i64") == 0) { *size_out = 8; *(int64_t *)data = (int64_t)strtoll(val_str, NULL, 0); }
+    else if (strcmp(type_name, "u64") == 0) { *size_out = 8; *(uint64_t *)data = (uint64_t)strtoull(val_str, NULL, 0); }
+    else if (strcmp(type_name, "f32") == 0) { *size_out = 4; *(float *)data = strtof(val_str, NULL); }
+    else if (strcmp(type_name, "f64") == 0) { *size_out = 8; *(double *)data = strtod(val_str, NULL); }
+    else return false;
+    return true;
+}
+
+// Read the daemon's pid, or 0 when none is running.
+static int freeze_daemon_pid(int pid) {
+    char path[256];
+    freeze_pid_path(path, sizeof(path), pid);
     FILE *f = fopen(path, "r");
-    if (!f) { print_error("Cannot read maps", errno); return 1; }
+    if (!f) return 0;
+    int out = 0;
+    if (fscanf(f, "%d", &out) != 1) out = 0;
+    fclose(f);
+    if (!pid_alive(out)) return 0;
+    return out;
+}
+
+// Start the daemon if it is not already running. Re-execs this binary; the
+// child inherits nothing but needs to stay alive after we exit, so it is
+// spawned detached and the parent never waits on it.
+static int freeze_ensure_daemon(int pid, int interval_ms) {
+    if (freeze_daemon_pid(pid) > 0) return 0;
+
+    // argv must outlive the fork call only; the child gets a copy.
+    char self[512];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (n <= 0) snprintf(self, sizeof(self), "/data/local/tmp/hmkpm_cli");
+    else self[n] = '\0';
+
+    char pid_s[16], iv_s[16];
+    snprintf(pid_s, sizeof(pid_s), "%d", pid);
+    snprintf(iv_s, sizeof(iv_s), "%d", interval_ms);
+
+    pid_t child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        // Detach: new session, no controlling terminal, stdio to /dev/null.
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, 0);
+            dup2(devnull, 1);
+            dup2(devnull, 2);
+            if (devnull > 2) close(devnull);
+        }
+        execl(self, self, "_freeze_daemon", pid_s, iv_s, (char *)NULL);
+        _exit(127);
+    }
+    // Give the child a moment to publish its pid file before we report success.
+    for (int i = 0; i < 50; i++) {
+        if (freeze_daemon_pid(pid) > 0) return 0;
+        struct timespec ts = { 0, 10 * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return -1;
+}
+
+// Resolve the addresses to freeze: an explicit list, or a scan session when
+// none is given (the common flow: scan -> filter -> freeze the survivors).
+static uint32_t freeze_resolve_addrs(int pid, const char *type_name, int argc, char **argv,
+                                     uint64_t *addrs, uint32_t max) {
+    uint32_t n = 0;
+    if (argc > 0) {
+        for (int i = 0; i < argc && n < max; i++) addrs[n++] = strtoull(argv[i], NULL, 0);
+        return n;
+    }
+    struct scan_session sess;
+    memset(&sess, 0, sizeof(sess));
+    if (session_load(pid, type_name, &sess) != 0) return 0;
+    for (uint32_t i = 0; i < sess.count && n < max; i++) addrs[n++] = sess.entries[i].addr;
+    session_free(&sess);
+    return n;
+}
+
+// argv: freeze_add <pid> <type> <value> <interval_ms> [addr ...]
+static int cmd_freeze_add(int pid, const char *type_name, const char *val_str,
+                          int interval_ms, int argc, char **argv) {
+    uint8_t data[8], size = 0;
+    if (!parse_typed_value(type_name, val_str, data, &size)) {
+        print_error("Invalid type", EINVAL);
+        return 1;
+    }
+
+    uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * FREEZE_MAX_SLOTS);
+    if (!addrs) { print_error("Out of memory", ENOMEM); return 1; }
+    uint32_t want = freeze_resolve_addrs(pid, type_name, argc, argv, addrs, FREEZE_MAX_SLOTS);
+    if (want == 0) {
+        free(addrs);
+        print_error("No addresses given and no scan session to freeze", ENOENT);
+        return 1;
+    }
+
+    // Merge with any existing slots so repeated calls accumulate instead of
+    // clobbering the previous freeze set.
+    struct freeze_slot slots[FREEZE_MAX_SLOTS];
+    uint32_t existing = 0;
+    if (freeze_load_slots(pid, slots, FREEZE_MAX_SLOTS, &existing) != 0) existing = 0;
+
+    uint32_t added = 0, total = existing;
+    for (uint32_t i = 0; i < want && total < FREEZE_MAX_SLOTS; i++) {
+        bool dup = false;
+        for (uint32_t k = 0; k < total; k++) {
+            if (slots[k].addr == addrs[i]) { dup = true; break; }
+        }
+        if (dup) continue;
+        slots[total].addr = addrs[i];
+        memcpy(slots[total].data, data, 8);
+        slots[total].size = size;
+        total++;
+        added++;
+    }
+    free(addrs);
+
+    // Write once immediately so the value is correct even before the daemon
+    // ticks (or if the daemon fails to start on an unprivileged device).
+    uint32_t written = 0;
+    for (uint32_t i = 0; i < total; i++) {
+        if (raw_write(pid, slots[i].addr, slots[i].data, slots[i].size) == 0) written++;
+    }
+
+    if (freeze_save_slots(pid, slots, total) != 0) {
+        print_error("Cannot persist freeze state", errno);
+        return 1;
+    }
+    int dpid_ok = freeze_ensure_daemon(pid, interval_ms);
+    int dpid = freeze_daemon_pid(pid);
+
+    printf("{\"status\":\"ok\",\"pid\":%d,\"type\":\"%s\",\"added\":%u,\"slots\":%u,"
+           "\"written\":%u,\"interval_ms\":%d,\"daemon\":%d,\"running\":%s}\n",
+           pid, type_name, added, total, written, interval_ms, dpid,
+           (dpid_ok == 0 && dpid > 0) ? "true" : "false");
+    return 0;
+}
+
+// argv: freeze_remove <pid> [addr ...]   (no addr = clear everything)
+static int cmd_freeze_remove(int pid, int argc, char **argv) {
+    if (argc == 0) {
+        char path[256];
+        freeze_state_path(path, sizeof(path), pid);
+        unlink(path);
+        int dpid = freeze_daemon_pid(pid);
+        if (dpid > 0) kill(dpid, SIGTERM);
+        // The daemon also removes the pid file when it notices the empty state.
+        char pidp[256];
+        freeze_pid_path(pidp, sizeof(pidp), pid);
+        for (int i = 0; i < 30 && freeze_daemon_pid(pid) > 0; i++) {
+            struct timespec ts = { 0, 10 * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+        unlink(pidp);
+        printf("{\"status\":\"ok\",\"pid\":%d,\"cleared\":true,\"remaining\":0}\n", pid);
+        return 0;
+    }
+
+    struct freeze_slot slots[FREEZE_MAX_SLOTS];
+    uint32_t n = 0;
+    if (freeze_load_slots(pid, slots, FREEZE_MAX_SLOTS, &n) != 0 || n == 0) {
+        printf("{\"status\":\"ok\",\"pid\":%d,\"removed\":0,\"remaining\":0}\n", pid);
+        return 0;
+    }
+
+    uint32_t kept = 0, removed = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        bool drop = false;
+        for (int k = 0; k < argc; k++) {
+            if (slots[i].addr == strtoull(argv[k], NULL, 0)) { drop = true; break; }
+        }
+        if (drop) { removed++; continue; }
+        slots[kept++] = slots[i];
+    }
+
+    if (kept == 0) {
+        char path[256];
+        freeze_state_path(path, sizeof(path), pid);
+        unlink(path);
+        int dpid = freeze_daemon_pid(pid);
+        if (dpid > 0) kill(dpid, SIGTERM);
+    } else {
+        freeze_save_slots(pid, slots, kept);
+    }
+    printf("{\"status\":\"ok\",\"pid\":%d,\"removed\":%u,\"remaining\":%u}\n", pid, removed, kept);
+    return 0;
+}
+
+// Report what is frozen and whether the daemon is alive. Values are re-read so
+// the caller can see the freeze actually holding.
+static int cmd_freeze_list(int pid) {
+    struct freeze_slot slots[FREEZE_MAX_SLOTS];
+    uint32_t n = 0;
+    int dpid = freeze_daemon_pid(pid);
+
+    if (freeze_load_slots(pid, slots, FREEZE_MAX_SLOTS, &n) != 0) n = 0;
+
+    printf("{\"status\":\"ok\",\"pid\":%d,\"daemon\":%d,\"running\":\"%s\",\"count\":%u,\"slots\":[",
+           pid, dpid, dpid > 0 ? "true" : "false", n);
+    for (uint32_t i = 0; i < n; i++) {
+        printf("%s{\"addr\":\"0x%llx\",\"size\":%u,\"data\":\"",
+               i ? "," : "", (unsigned long long)slots[i].addr, slots[i].size);
+        for (uint32_t b = 0; b < slots[i].size; b++) printf("%02x", slots[i].data[b]);
+        printf("\"}");
+    }
+    printf("]}\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Heap/module dump to a file.
+//
+// The inline `read` caps at 16 MiB of hex and blows up the JSON on anything
+// bigger. A dump streams directly to a file on the device, with a .txt sidecar
+// of VMA offsets so the caller can map file offsets back to addresses.
+// ---------------------------------------------------------------------------
+
+// argv: dump <pid> <addr|module:NAME> <size|all> <out_path> [perms]
+static int cmd_dump(int pid, const char *target, const char *size_arg,
+                    const char *out_path, const char *filter_perms) {
+    struct vma_table t;
+    if (!vma_table_load(pid, &t)) { print_error("Cannot read maps", errno); return 1; }
+
+    uint64_t start = 0, end = 0;
+    bool whole_module = false;
+    if (strncmp(target, "module:", 7) == 0) {
+        uint64_t base = 0, span_end = 0;
+        uint32_t vmas = 0;
+        if (!module_lookup(&t, target + 7, &base, &span_end, &vmas)) {
+            vma_table_free(&t);
+            print_error("Module not mapped in this process", ENOENT);
+            return 1;
+        }
+        // A module's segments are not contiguous: dump the union of every VMA
+        // that belongs to it, which is what a reverse engineer wants.
+        start = base;
+        end = 0;
+        for (uint32_t i = 0; i < t.count; i++) {
+            if (strcmp(vma_leaf(t.items[i].path), target + 7) != 0) continue;
+            if (t.items[i].end > end) end = t.items[i].end;
+        }
+        whole_module = true;
+    } else {
+        start = strtoull(target, NULL, 0);
+        if (strcmp(size_arg, "all") == 0) {
+            // Everything readable from `start` onward, stopping at the first
+            // unmapped gap.
+            end = start;
+            bool grew = true;
+            while (grew) {
+                grew = false;
+                for (uint32_t i = 0; i < t.count; i++) {
+                    if (!perms_match(t.items[i].perms, filter_perms)) continue;
+                    if (t.items[i].start <= end && t.items[i].end > end) {
+                        end = t.items[i].end;
+                        grew = true;
+                    }
+                }
+            }
+            if (end <= start) {
+                vma_table_free(&t);
+                print_error("No readable region at that address", EINVAL);
+                return 1;
+            }
+        } else {
+            uint64_t want = strtoull(size_arg, NULL, 0);
+            if (want == 0) { vma_table_free(&t); print_error("size must be > 0", EINVAL); return 1; }
+            end = start + want;
+        }
+    }
+
+    uint64_t total = end - start;
+    int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        vma_table_free(&t);
+        print_error("Cannot create output file", errno);
+        return 1;
+    }
+
+    const size_t CHUNK = 256 * 1024;
+    uint8_t *buf = (uint8_t *)malloc(CHUNK);
+    if (!buf) { close(fd); vma_table_free(&t); print_error("Out of memory", ENOMEM); return 1; }
+
+    char sidecar[600];
+    snprintf(sidecar, sizeof(sidecar), "%s.txt", out_path);
+    FILE *map = fopen(sidecar, "w");
+    if (map) {
+        fprintf(map, "# offset addr size perms path\n");
+    }
+
+    uint64_t written = 0, unreadable = 0;
+    uint64_t cur = start;
+    while (cur < end) {
+        size_t want = (size_t)(end - cur);
+        if (want > CHUNK) want = CHUNK;
+
+        // Find the VMA covering `cur`; when there is none (a gap between
+        // mappings) skip ahead to the next one that starts after it.
+        uint32_t slot = t.count;
+        for (uint32_t i = 0; i < t.count; i++) {
+            if (t.items[i].start <= cur && t.items[i].end > cur) { slot = i; break; }
+        }
+        if (slot == t.count) {
+            uint64_t next = end;
+            for (uint32_t i = 0; i < t.count; i++) {
+                if (t.items[i].start > cur && t.items[i].start < next) next = t.items[i].start;
+            }
+            // Fill the gap with zeros so file offsets still equal addr-start.
+            size_t gap = (size_t)(next - cur);
+            memset(buf, 0, gap < CHUNK ? gap : CHUNK);
+            if (write(fd, buf, gap < CHUNK ? gap : CHUNK) < 0) break;
+            written += gap < CHUNK ? gap : CHUNK;
+            unreadable += gap < CHUNK ? gap : CHUNK;
+            cur += gap < CHUNK ? gap : CHUNK;
+            continue;
+        }
+        if (t.items[slot].end < cur + want) want = (size_t)(t.items[slot].end - cur);
+
+        // raw_read fills holes inside the span with zeros and still returns the
+        // readable pages, so byte counts are per page, not per chunk. A chunk
+        // wholly inside one VMA that fails is an unbacked region (dalvik
+        // reserves its heap without committing it), which is normal.
+        if (!raw_read(pid, cur, buf, want)) unreadable += want;
+        if (write(fd, buf, want) < 0) break;
+        if (map) {
+            fprintf(map, "0x%llx 0x%llx 0x%llx %s %s\n",
+                    (unsigned long long)(cur - start), (unsigned long long)cur,
+                    (unsigned long long)want, t.items[slot].perms,
+                    t.items[slot].path[0] ? t.items[slot].path : "[anon]");
+        }
+        written += want;
+        cur += want;
+    }
+    if (map) fclose(map);
+    fsync(fd);
+    close(fd);
+    free(buf);
+    vma_table_free(&t);
+
+    printf("{\"status\":\"ok\",\"pid\":%d,\"start\":\"0x%llx\",\"end\":\"0x%llx\","
+           "\"span_bytes\":%llu,\"bytes\":%llu,\"unreadable_bytes\":%llu,"
+           "\"file\":\"%s\",\"map_file\":\"%s\",\"module\":%s}\n",
+           pid, (unsigned long long)start, (unsigned long long)end,
+           (unsigned long long)total, (unsigned long long)written,
+           (unsigned long long)unreadable,
+           out_path, sidecar, whole_module ? "true" : "false");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Module-relative (RVA) scanning.
+//
+// Absolute addresses are worthless across a restart. The stable identifier is
+// "offset inside libX.so", so an RVA scan reports module + offset (+0x..) and
+// never the absolute address. Value semantics are identical to `scan`, but the
+// ranges are restricted to the module's own VMAs.
+// ---------------------------------------------------------------------------
+
+// argv: scan_rva <pid> <module> <type> <value> [align]
+static int cmd_scan_rva(int pid, const char *module, const char *type_name,
+                        const char *val_str, int custom_align) {
+    uint8_t elem_size = 4, align = 4;
+    uint8_t type = scan_type_from_name(type_name, &elem_size, &align);
+    if (type == 0) { print_error("Invalid scan type", EINVAL); return 1; }
+    if (custom_align > 0) align = (uint8_t)custom_align;
+
+    uint64_t criteria_val = 0;
+    if (type == HMKPM_SCAN_TYPE_F32) {
+        float f = strtof(val_str, NULL);
+        memcpy(&criteria_val, &f, 4);
+    } else if (type == HMKPM_SCAN_TYPE_F64) {
+        double d = strtod(val_str, NULL);
+        memcpy(&criteria_val, &d, 8);
+    } else if (type == HMKPM_SCAN_TYPE_I64) {
+        criteria_val = (uint64_t)strtoll(val_str, NULL, 0);
+    } else if (type == HMKPM_SCAN_TYPE_U64) {
+        criteria_val = strtoull(val_str, NULL, 0);
+    } else {
+        criteria_val = (uint64_t)strtoll(val_str, NULL, 0);
+    }
+
+    struct vma_table t;
+    if (!vma_table_load(pid, &t)) { print_error("Cannot read maps", errno); return 1; }
+
+    uint64_t base = 0, span_end = 0;
+    uint32_t vmas = 0;
+    if (!module_lookup(&t, module, &base, &span_end, &vmas)) {
+        vma_table_free(&t);
+        print_error("Module not mapped in this process", ENOENT);
+        return 1;
+    }
+
+    // Only the module's own readable segments are scanned. The base is the
+    // mapping whose file offset is 0, so an RVA equals (addr - base) even
+    // though the segments are not contiguous.
+    struct hmkpm_scan_range *ranges =
+        (struct hmkpm_scan_range *)malloc(sizeof(struct hmkpm_scan_range) * (vmas ? vmas : 1));
+    if (!ranges) { vma_table_free(&t); print_error("Out of memory", ENOMEM); return 1; }
+    uint32_t rc = 0;
+    for (uint32_t i = 0; i < t.count; i++) {
+        if (strcmp(vma_leaf(t.items[i].path), module) != 0) continue;
+        if (!perms_match(t.items[i].perms, NULL)) continue;
+        ranges[rc].start_va = t.items[i].start;
+        ranges[rc].size = t.items[i].end - t.items[i].start;
+        rc++;
+    }
+    vma_table_free(&t);
+
+    if (rc == 0) {
+        free(ranges);
+        printf("{\"status\":\"ok\",\"pid\":%d,\"module\":\"%s\",\"base\":\"0x%llx\","
+               "\"matches_found\":0,\"rvas\":[]}\n",
+               pid, module, (unsigned long long)base);
+        return 0;
+    }
+
+    #define RVA_MAX_MATCHES 4096
+    uint64_t found = 0;
+    uint32_t reported = 0;
+    uint64_t *matches = NULL;
+    if (!kernel_scan_ranges(pid, type, align, criteria_val, ranges, rc,
+                            RVA_MAX_MATCHES, &found, &matches, &reported)) {
+        free(ranges);
+        print_error("HMKPM scan kernel syscall failed", errno ? errno : EFAULT);
+        return 1;
+    }
+    free(ranges);
+
+    printf("{\"status\":\"ok\",\"pid\":%d,\"module\":\"%s\",\"base\":\"0x%llx\","
+           "\"matches_found\":%llu,\"truncated\":%s,\"rvas\":[",
+           pid, module, (unsigned long long)base, (unsigned long long)found,
+           found > RVA_MAX_MATCHES ? "true" : "false");
+    for (uint32_t i = 0; i < reported; i++) {
+        printf("%s\"0x%llx\"", i ? "," : "",
+               (unsigned long long)(matches[i] - base));
+    }
+    printf("]}\n");
+    free(matches);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// ARM64 instruction-pattern search.
+//
+// Game logic that resets a value lives in code, not data, so finding the
+// instruction that writes a field is a routine step when a memory freeze is not
+// appropriate. The pattern is an ARM64 encoding where some bit fields are fixed
+// and the rest are wildcards, e.g. "B9000000/FFF00000" for a 32-bit STR with
+// any Rt/Rn/offset. Matching is over little-endian 4-byte words.
+// ---------------------------------------------------------------------------
+
+// argv: find_instructions <pid> <pattern[/mask]> <module|perms> [limit]
+static int cmd_find_instructions(int pid, const char *pattern, const char *where, int limit) {
+    char value_s[32] = {0}, mask_s[32] = {0};
+    const char *slash = strchr(pattern, '/');
+    if (slash) {
+        size_t n = (size_t)(slash - pattern);
+        if (n >= sizeof(value_s)) { print_error("Pattern too long", EINVAL); return 1; }
+        memcpy(value_s, pattern, n);
+        value_s[n] = '\0';
+        snprintf(mask_s, sizeof(mask_s), "%s", slash + 1);
+    } else {
+        snprintf(value_s, sizeof(value_s), "%s", pattern);
+        snprintf(mask_s, sizeof(mask_s), "FFFFFFFF");
+    }
+
+    uint32_t value = (uint32_t)strtoul(value_s, NULL, 16);
+    uint32_t mask  = (uint32_t)strtoul(mask_s, NULL, 16);
+    if (mask == 0) { print_error("Mask must not be zero", EINVAL); return 1; }
+    if (limit <= 0) limit = 100;
+
+    struct vma_table t;
+    if (!vma_table_load(pid, &t)) { print_error("Cannot read maps", errno); return 1; }
+
+    // Executable, readable segments: either one module's code or every VMA
+    // that matches the permission filter.
+    bool by_module = strchr(where, '.') != NULL || strchr(where, '/') != NULL;
+    bool by_perm = !by_module && strchr(where, 'x') != NULL;
 
     uint64_t base = 0;
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        uint64_t start = 0, end = 0, offset = 0;
-        char perms[8] = {0}, dev[16] = {0};
-        unsigned long inode = 0;
-        char pathname[256] = {0};
-        int c = sscanf(line, "%llx-%llx %7s %llx %15s %lu %255[^\n]",
-                       (unsigned long long *)&start, (unsigned long long *)&end,
-                       perms, (unsigned long long *)&offset, dev, &inode, pathname);
-        if (c < 7) continue;
-        char *name = pathname;
-        while (*name == ' ') name++;
-        const char *slash = strrchr(name, '/');
-        const char *leaf = slash ? slash + 1 : name;
-        if (strcmp(leaf, module) != 0) continue;
-        // The first mapping of a module with offset 0 is its load base.
-        if (offset == 0) { base = start; break; }
-        if (!base) base = start;               // fall back to the lowest VMA
+    if (by_module) {
+        uint64_t span_end = 0;
+        uint32_t vmas = 0;
+        if (!module_lookup(&t, where, &base, &span_end, &vmas)) {
+            vma_table_free(&t);
+            print_error("Module not mapped in this process", ENOENT);
+            return 1;
+        }
     }
-    fclose(f);
 
-    if (!base) { print_error("Module not mapped in this process", ENOENT); return 1; }
-    uint64_t rva = rva_str ? strtoull(rva_str, NULL, 0) : 0;
-    printf("{\"status\":\"ok\",\"pid\":%d,\"module\":\"%s\",\"base\":\"0x%llx\",\"rva\":\"0x%llx\",\"address\":\"0x%llx\"}\n",
-           pid, module, (unsigned long long)base, (unsigned long long)rva,
-           (unsigned long long)(base + rva));
+    printf("{\"status\":\"ok\",\"pid\":%d,\"pattern\":\"%08x/%08x\",\"matches\":[",
+           pid, value, mask);
+
+    const size_t CHUNK = 256 * 1024;
+    uint8_t *buf = (uint8_t *)malloc(CHUNK);
+    if (!buf) { vma_table_free(&t); print_error("Out of memory", ENOMEM); return 1; }
+
+    int found = 0;
+    for (uint32_t i = 0; i < t.count && found < limit; i++) {
+        struct vma *v = &t.items[i];
+        if (v->perms[2] != 'x' || v->perms[0] != 'r') continue;
+        if (by_module) {
+            const char *leaf = vma_leaf(v->path);
+            if (strcmp(leaf, where) != 0) continue;
+        } else if (by_perm) {
+            if (!perms_match(v->perms, where)) continue;
+        }
+
+        uint64_t cur = v->start;
+        while (cur < v->end && found < limit) {
+            size_t want = (size_t)(v->end - cur);
+            if (want > CHUNK) want = CHUNK;
+            if (raw_read(pid, cur, buf, want)) {
+                for (size_t off = 0; off + 4 <= want && found < limit; off += 4) {
+                    uint32_t insn;
+                    memcpy(&insn, buf + off, 4);
+                    if ((insn & mask) != (value & mask)) continue;
+                    uint64_t at = cur + off;
+                    // A bare absolute address is useless after a restart, so an
+                    // RVA is always reported alongside it when it is inside a
+                    // module.
+                    if (by_module) {
+                        printf("%s{\"addr\":\"0x%llx\",\"rva\":\"0x%llx\",\"insn\":\"%08x\"}",
+                               found ? "," : "", (unsigned long long)at,
+                               (unsigned long long)(at - base), insn);
+                    } else {
+                        const char *leaf = vma_leaf(v->path);
+                        if (leaf[0] && strchr(leaf, '.')) {
+                            uint64_t mbase = 0, mspan = 0;
+                            uint32_t mvmas = 0;
+                            module_lookup(&t, leaf, &mbase, &mspan, &mvmas);
+                            printf("%s{\"addr\":\"0x%llx\",\"module\":\"%s\",\"rva\":\"0x%llx\",\"insn\":\"%08x\"}",
+                                   found ? "," : "", (unsigned long long)at, leaf,
+                                   (unsigned long long)(at >= mbase ? at - mbase : 0), insn);
+                        } else {
+                            printf("%s{\"addr\":\"0x%llx\",\"insn\":\"%08x\"}",
+                                   found ? "," : "", (unsigned long long)at, insn);
+                        }
+                    }
+                    found++;
+                }
+            }
+            cur += want;
+        }
+    }
+    printf("],\"count\":%d}\n", found);
+
+    free(buf);
+    vma_table_free(&t);
+    return 0;
+}
+
+// Internal: a writable test target. `_hold <millis>` allocates a page, stamps
+// a known pattern into it and sleeps, so write/freeze paths have a real process
+// to work against without ever touching an app's live heap. Not exposed to MCP.
+static int cmd_hold(int millis) {
+    if (millis <= 0) millis = 1000;
+    if (millis > 3600000) millis = 3600000;
+    // A dedicated anonymous mapping, not malloc: glibc's allocator hands out
+    // addresses from a large reservation whose pages are not resident until
+    // touched, and the kernel cannot read an unbacked page.
+    size_t len = PAGE_SIZE_ * 4;
+    void *mem = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+    if (mem == MAP_FAILED) { print_error("mmap failed", errno); return 1; }
+    volatile uint32_t *page = (volatile uint32_t *)mem;
+    for (size_t i = 0; i < len / 4; i++) page[i] = 0x11111111u;
+    printf("{\"status\":\"ok\",\"pid\":%d,\"addr\":\"0x%llx\",\"size\":%zu}\n",
+           (int)getpid(), (unsigned long long)(uintptr_t)mem, len);
+    fflush(stdout);
+    struct timespec ts = { millis / 1000, (long)(millis % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+    munmap(mem, len);
     return 0;
 }
 
@@ -1494,7 +2609,21 @@ int main(int argc, char **argv) {
                "  scan_unknown <pid> <type> [align] [filter_perms]           (slow: snapshot all)\n"
                "  scan_filter  <pid> <type> <gt|lt|eq|ne|changed|unchanged|increased|decreased|range> [arg]\n"
                "  scan_results <pid> <type>\n"
-               "  scan_reset   <pid> <type>\n");
+               "  scan_reset   <pid> <type>\n"
+               "\n"
+               "Lookup / analysis:\n"
+               "  read_values  <pid> <type> <addr> [addr ...]\n"
+               "  find_string  <pid> <needle> [perms] [limit]\n"
+               "  module_base  <pid> <module> [rva]\n"
+               "  pointer_chain <pid> <module|0xaddr> <rva> <type> [off ...]  (last offset not dereferenced)\n"
+               "  scan_rva     <pid> <module> <type> <value> [align]          (reports offsets, not addresses)\n"
+               "  find_instructions <pid> <pattern[/mask]> <module|x-perms> [limit]\n"
+               "  dump         <pid> <addr|module:NAME> <size|all> <out_path> [perms]\n"
+               "\n"
+               "Value freezing (detached daemon):\n"
+               "  freeze_add    <pid> <type> <value> <interval_ms> [addr ...]  (no addr = use scan session)\n"
+               "  freeze_remove <pid> [addr ...]                              (no addr = clear all)\n"
+               "  freeze_list   <pid>\n");
         return 0;
     }
 
@@ -1587,6 +2716,36 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "module_base") == 0 && argc >= 4) {
         const char *rva = argc >= 5 ? argv[4] : NULL;
         return cmd_module_base(atoi(argv[2]), argv[3], rva);
+    } else if (strcmp(cmd, "pointer_chain") == 0 && argc >= 6) {
+        // pointer_chain <pid> <base_module|0xaddr> <rva> <type> [off ...]
+        return cmd_pointer_chain(atoi(argv[2]), argv[3], argv[4], argv[5],
+                                 argc - 6, &argv[6]);
+    } else if (strcmp(cmd, "freeze_add") == 0 && argc >= 6) {
+        // freeze_add <pid> <type> <value> <interval_ms> [addr ...]
+        return cmd_freeze_add(atoi(argv[2]), argv[3], argv[4], atoi(argv[5]),
+                              argc - 6, &argv[6]);
+    } else if (strcmp(cmd, "freeze_remove") == 0 && argc >= 3) {
+        return cmd_freeze_remove(atoi(argv[2]), argc - 3, &argv[3]);
+    } else if (strcmp(cmd, "freeze_list") == 0 && argc >= 3) {
+        return cmd_freeze_list(atoi(argv[2]));
+    } else if (strcmp(cmd, "_hold") == 0) {
+        return cmd_hold(argc >= 3 ? atoi(argv[2]) : 5000);
+    } else if (strcmp(cmd, "_freeze_daemon") == 0 && argc >= 4) {
+        // Internal: spawned by freeze_add, never called by a user or the MCP.
+        return cmd_freeze_daemon(atoi(argv[2]), atoi(argv[3]),
+                                 argc >= 5 ? argv[4] : NULL);
+    } else if (strcmp(cmd, "dump") == 0 && argc >= 6) {
+        // dump <pid> <addr|module:NAME> <size|all> <out_path> [perms]
+        return cmd_dump(atoi(argv[2]), argv[3], argv[4], argv[5],
+                        argc >= 7 ? argv[6] : NULL);
+    } else if (strcmp(cmd, "scan_rva") == 0 && argc >= 6) {
+        // scan_rva <pid> <module> <type> <value> [align]
+        return cmd_scan_rva(atoi(argv[2]), argv[3], argv[4], argv[5],
+                            argc >= 7 ? atoi(argv[6]) : 0);
+    } else if (strcmp(cmd, "find_instructions") == 0 && argc >= 5) {
+        // find_instructions <pid> <pattern[/mask]> <module|perms> [limit]
+        return cmd_find_instructions(atoi(argv[2]), argv[3], argv[4],
+                                     argc >= 6 ? atoi(argv[5]) : 100);
     }
 
     print_error("Unknown command or missing arguments", EINVAL);

@@ -387,5 +387,197 @@ export function buildServer(options) {
     },
   );
 
+  // 15. pointer_chain -- multi-level pointer resolution
+  server.registerTool(
+    "pointer_chain",
+    {
+      title: "Resolve a multi-level pointer chain",
+      description:
+        "Resolve base+rva -> [off1] -> [off2] -> ... -> final address in a single call. The last offset is added WITHOUT dereferencing, so it names the field itself. The base may be a module name (resolved to its load base, surviving restarts) or an absolute address. Returns every hop with its intermediate pointer, so a broken chain shows exactly which step failed.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        base: z
+          .union([z.string(), z.number()])
+          .describe("Module name (e.g. \"libil2cpp.so\") or an absolute base address."),
+        rva: z
+          .union([z.string(), z.number()])
+          .default(0)
+          .describe("Offset added to the base before the first dereference."),
+        offsets: z
+          .array(z.union([z.string(), z.number()]))
+          .default([])
+          .describe("Chain offsets. All but the last are dereferenced; the last is the final field offset."),
+        type: z.enum(TYPES).default("i32").describe("Type used to read the final value."),
+      },
+    },
+    async ({ pid, base, rva, offsets, type }) => {
+      try {
+        return ok(await tools.pointerChain({ pid, base, rva, offsets, type }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // 16. freeze_value -- pin addresses to a fixed value
+  server.registerTool(
+    "freeze_value",
+    {
+      title: "Freeze addresses at a fixed value",
+      description:
+        "Keep one or more addresses pinned to a value. A detached daemon on the device rewrites them on an interval, so the app cannot overwrite the value between calls. Omit `addresses` to freeze every survivor of the current scan session (scan_seed / scan_filter). Freezing is per target process and survives MCP restarts until unfreeze_value or a reboot.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        type: z.enum(TYPES).default("i32").describe("Data type."),
+        value: z.union([z.string(), z.number()]).describe("Value to hold."),
+        addresses: z
+          .array(z.union([z.string(), z.number()]))
+          .max(256)
+          .optional()
+          .describe("Addresses to freeze; omit to use the current scan session."),
+        intervalMs: z
+          .number()
+          .int()
+          .min(10)
+          .max(2000)
+          .default(50)
+          .describe("Rewrite interval in ms (default 50)."),
+      },
+    },
+    async ({ pid, type, value, addresses, intervalMs }) => {
+      try {
+        return ok(await tools.freeze({ pid, type, value, addresses, intervalMs }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // 17. unfreeze_value
+  server.registerTool(
+    "unfreeze_value",
+    {
+      title: "Release frozen addresses",
+      description:
+        "Stop freezing addresses for this process. With no arguments every freeze is released and the daemon exits; otherwise only the listed addresses are released.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        addresses: z
+          .array(z.union([z.string(), z.number()]))
+          .optional()
+          .describe("Addresses to release; omit to release everything."),
+      },
+    },
+    async ({ pid, addresses }) => {
+      try {
+        return ok(await tools.unfreeze({ pid, addresses }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // 18. list_freezes
+  server.registerTool(
+    "list_freezes",
+    {
+      title: "List frozen addresses and daemon status",
+      description:
+        "Report which addresses are frozen for a process, the bytes being written, and whether the freeze daemon is alive. Use it to confirm a freeze is actually holding before relying on it.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+      },
+    },
+    async ({ pid }) => {
+      try {
+        return ok(await tools.freezeList({ pid }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // 19. dump_memory
+  server.registerTool(
+    "dump_memory",
+    {
+      title: "Dump a memory region or module to a file",
+      description:
+        "Stream a memory region, or a whole module, to a file on the device instead of returning hex inline. A .txt sidecar is written next to it mapping file offsets to addresses and permissions, so the dump can be loaded in IDA/Ghidra or parsed directly. Passing a module name dumps every segment that belongs to it.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        target: z
+          .union([z.string(), z.number()])
+          .describe("Module name (e.g. \"libil2cpp.so\") or a start address."),
+        size: z
+          .union([z.string(), z.number()])
+          .default("all")
+          .describe("\"all\" to dump every readable region from the start, or a byte count."),
+        outPath: z.string().min(1).describe("Destination path on the device."),
+        perms: z.string().default("rw-p").describe("Permission filter used when size is \"all\"."),
+      },
+    },
+    async ({ pid, target, size, outPath, perms }) => {
+      try {
+        return ok(await tools.dump({ pid, target, size, outPath, perms }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // 20. scan_rva -- module-relative scan
+  server.registerTool(
+    "scan_rva",
+    {
+      title: "Scan inside one module, report RVAs",
+      description:
+        "Scan a single module's readable segments for a value and report module-relative offsets instead of absolute addresses. Offsets stay valid across restarts and are what a pointer chain or a code patch needs, so prefer this over scan_kernel when the target lives in native code.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        module: z.string().min(1).describe("Library file name, e.g. \"libil2cpp.so\"."),
+        type: z.enum(TYPES).default("i32").describe("Data type."),
+        value: z.union([z.string(), z.number()]).describe("Value to find."),
+        align: z.number().int().positive().optional().describe("Alignment override."),
+      },
+    },
+    async ({ pid, module, type, value, align }) => {
+      try {
+        return ok(await tools.scanRva({ pid, module, value, type, align }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // 21. find_instructions -- ARM64 pattern search
+  server.registerTool(
+    "find_instructions",
+    {
+      title: "Search executable memory for ARM64 instructions",
+      description:
+        "Find an ARM64 instruction by opcode with wildcard bits: pass \"B9000000/FFF00000\" for a 32-bit STR with any registers/offset. Searches one module (e.g. \"libil2cpp.so\") or every segment matching a permission filter. Results include the module and RVA for module hits, so a code patch can be located again after a restart. Common patterns: RET D65F03C0/FFFFFFFF, NOP D503201F/FFFFFFFF, BL 94000000/FC000000, MOVZ 52800000/FF800000.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        pattern: z
+          .string()
+          .min(1)
+          .describe("Instruction and mask as \"hexvalue/hexmask\" (mask defaults to FFFFFFFF)."),
+        where: z
+          .string()
+          .default("r-xp")
+          .describe("Module file name, or a permission filter such as \"r-xp\"."),
+        limit: z.number().int().positive().max(5000).default(100).describe("Maximum results."),
+      },
+    },
+    async ({ pid, pattern, where, limit }) => {
+      try {
+        return ok(await tools.findInstructions({ pid, pattern, where, limit }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
   return server;
 }
