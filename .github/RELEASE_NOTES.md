@@ -1,3 +1,21 @@
+## v1.1.1 修复了什么 (MilkCode / SSE 客户端兼容性修复)
+
+这个补丁版本修复了 MilkCode 与 Operit 等客户端在平板端直连时的协议兼容性问题：
+
+1. **修复 MilkCode 客户端报错「MCP 响应 id 不匹配」**
+   - 之前服务端对根路径 `/` 的 GET/POST 未做区分，将健康检查 JSON 返回给了客户端的 JSON-RPC 初始化请求，导致客户端因为返回缺少匹配的 `id` 而抛出「响应 id 不匹配」。
+   - 现在健康检查严格限定在 `GET /health` 或 `GET /`；`POST /` 与 `POST /mcp` 统一无缝转发至 MCP Streamable HTTP 引擎。
+
+2. **修复标准 HTTP 客户端 406 Not Acceptable**
+   - 部分客户端在请求 MCP 时仅携带 `Accept: application/json`，Streamable HTTP 规范强校验 `application/json, text/event-stream` 导致返回 406 且 `id: null`。
+   - 服务端在进入 Streamable HTTP 传输层前自动补齐兼容媒体协商头部，保证通用客户端正常调用。
+
+3. **修复 SSE 模式无限递归崩溃与连接中断**
+   - 移除 `index.js` 中重复调用的 `sseTransport.start()`（`server.connect()` 内部已自动启动）。
+   - 修复 `sseTransport.onclose` 回调中重入调用 `server.close()` 触发的 `RangeError: Maximum call stack size exceeded` 栈溢出崩溃。
+
+---
+
 ## v1.1.0 新增了什么
 
 这个小版本把工具从 16 个扩到 **24 个**，并加入了脚本能力。

@@ -24,6 +24,7 @@ helper/vendor/lua/*.a
 *.backup
 
 # OS / editor cruft
+.playwright-mcp/
 .DS_Store
 Thumbs.db
 .idea/

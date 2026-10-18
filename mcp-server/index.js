@@ -48,8 +48,8 @@ async function runHttp() {
 
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
 
-    // Health check endpoint
-    if (url.pathname === "/health" || url.pathname === "/") {
+    // Health check endpoint (GET /health or GET /)
+    if ((req.method === "GET" || req.method === "HEAD") && (url.pathname === "/health" || url.pathname === "/")) {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({
         status: "ok",
@@ -73,12 +73,19 @@ async function runHttp() {
         sseTransports.set(sseTransport.sessionId, sseTransport);
 
         sseTransport.onclose = () => {
+          // Only drop the session here.
+          //
+          // Calling server.close() from this hook re-enters transport.close(),
+          // which invokes onclose again, recursing until the stack overflows.
+          // The transport is already closing on its own, so nothing further is
+          // required; the per-connection server becomes unreachable with it.
           sseTransports.delete(sseTransport.sessionId);
-          server.close().catch(() => {});
         };
 
+        // server.connect() already starts the transport; calling start() again
+        // throws "SSEServerTransport already started", which used to abort
+        // every SSE connection and cascade into a stack overflow.
         await server.connect(sseTransport);
-        await sseTransport.start();
         return;
       } catch (err) {
         console.error("[hmkpm-mcp] SSE connection error:", err);
@@ -111,9 +118,21 @@ async function runHttp() {
       return;
     }
 
-    // 3. Streamable HTTP mode: /mcp (Used by modern stateless HTTP MCP clients)
-    if (url.pathname === "/mcp") {
+    // 3. Streamable HTTP mode: /mcp or POST /
+    // Supports both modern Streamable HTTP MCP clients and standard JSON-RPC HTTP clients (like MilkCode).
+    if (url.pathname === "/mcp" || (url.pathname === "/" && req.method === "POST")) {
       try {
+        // Ensure Accept header includes both required media types so StreamableHTTPServerTransport
+        // does not reject standard HTTP JSON clients with a 406 Not Acceptable error.
+        const currentAccept = req.headers["accept"] || "";
+        if (!currentAccept.includes("text/event-stream")) {
+          req.headers["accept"] = currentAccept ? `${currentAccept}, text/event-stream` : "application/json, text/event-stream";
+        }
+        if (!req.headers["content-type"]) {
+          req.headers["content-type"] = "application/json";
+        }
+
+        console.error(`[hmkpm-mcp] HTTP MCP request: ${req.method} ${url.pathname}`);
         const server = buildServer(deviceOptions);
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined,
