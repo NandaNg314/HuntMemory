@@ -34,12 +34,37 @@ function run(cmd, args, { timeout = 30000, stdin } = {}) {
 
 // Parses the JSON output produced by hmkpm_cli.
 function parseCliJson(stdout) {
-  const line = stdout.trim().split(/\r?\n/).filter(Boolean).pop();
-  if (!line) throw new Error("Empty output from hmkpm_cli");
+  const trimmed = stdout.trim();
+  if (!trimmed) throw new Error("Empty output from hmkpm_cli");
   try {
-    return JSON.parse(line);
+    return JSON.parse(trimmed);
+  } catch {}
+
+  // Fall back: check if there's an embedded JSON object { ... }
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    try {
+      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+    } catch {}
+  }
+
+  // Fall back: check if there's an embedded JSON array [ ... ]
+  const firstBracket = trimmed.indexOf("[");
+  const lastBracket = trimmed.lastIndexOf("]");
+  if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+    try {
+      return JSON.parse(trimmed.slice(firstBracket, lastBracket + 1));
+    } catch {}
+  }
+
+  // Fall back to last non-empty line
+  const lines = trimmed.split(/\r?\n/).filter(Boolean);
+  const lastLine = lines[lines.length - 1];
+  try {
+    return JSON.parse(lastLine);
   } catch {
-    throw new Error(`Invalid JSON from hmkpm_cli: ${line.slice(0, 400)}`);
+    throw new Error(`Invalid JSON from hmkpm_cli: ${trimmed.slice(0, 400)}`);
   }
 }
 

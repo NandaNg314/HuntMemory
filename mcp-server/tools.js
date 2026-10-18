@@ -297,6 +297,16 @@ export class HmkpmTools {
   async threadStep({ pid, tid = 0, steps = 1 }) {
     return this.device.invoke(["step", String(pid), String(tid || 0), String(steps || 1)]);
   }
+
+  // List all threads in target process (TID, thread name, status)
+  async listThreads({ pid }) {
+    return this.device.invoke(["threads", String(pid)]);
+  }
+
+  // Set register value in target thread (PC, SP, LR, FP, X0-X30, W0-W30, PSTATE)
+  async setRegister({ pid, tid = 0, reg, value }) {
+    return this.device.invoke(["set_reg", String(pid), String(tid || 0), String(reg), asHex(value)]);
+  }
 }
 
 // The CLI parses numbers with strtol/strtoul base 0 (so "0x.." works) and

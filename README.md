@@ -59,6 +59,8 @@ hmkpm-mcp/
 | `thread_suspend` | **挂起目标线程或进程**：暂停目标指定线程（或主线程），现场抓取当前 PC、LR、全套通用寄存器（X0-X30, SP, FP）与调用栈回溯 | `pid`, `tid` |
 | `thread_resume` | **恢复目标线程或进程**：恢复之前暂停的目标线程或整个进程执行 | `pid`, `tid` |
 | `thread_step` | **单步控制执行**：对挂起线程执行 N 条指令单步步进，记录每步的 PC、反汇编指令与关键寄存器变化 | `pid`, `tid`, `steps` |
+| `list_threads` | **枚举进程子线程**：列出目标进程所有子线程的 TID、线程名（`comm`，如 `UnityMain`、`RenderThread`）与运行状态（`state`） | `pid` |
+| `set_register` | **动态改写寄存器**：在挂起或单步状态下直接改写通用寄存器或 PC（如伪造返回值 `X0`、跳转指定指令 `PC`） | `pid`, `tid`, `reg`, `value` |
 
 ### Lua 脚本（`run_lua`）
 

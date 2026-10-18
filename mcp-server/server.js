@@ -740,5 +740,46 @@ export function buildServer(options) {
     },
   );
 
+  // 29. list_threads -- list all threads in target process
+  server.registerTool(
+    "list_threads",
+    {
+      title: "List all threads in target process",
+      description: "Enumerate all threads (TID, thread name 'comm', and run state) within the target process. Use this to find UnityMain, render threads, or worker threads before setting breakpoints or suspending.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+      },
+    },
+    async ({ pid }) => {
+      try {
+        return ok(await tools.listThreads({ pid }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // 30. set_register -- set register value in target thread
+  server.registerTool(
+    "set_register",
+    {
+      title: "Set register value in target thread",
+      description: "Modify an ARM64 register value (PC, SP, LR, FP, X0-X30, W0-W30, PSTATE) in a suspended or attached thread. Useful for modifying return values (X0) or diverting execution flow (PC).",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        tid: z.number().int().min(0).default(0).describe("Specific thread ID (0 = target main PID)."),
+        reg: z.string().describe("Register name to modify: 'PC', 'SP', 'LR', 'FP', 'X0'~'X30', 'W0'~'W30', or 'PSTATE'."),
+        value: z.union([z.string(), z.number()]).describe("New register value in hex ('0x1', '0x7a81001234') or integer."),
+      },
+    },
+    async ({ pid, tid, reg, value }) => {
+      try {
+        return ok(await tools.setRegister({ pid, tid, reg, value }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
   return server;
 }

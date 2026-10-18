@@ -74,7 +74,7 @@ const run = async () => {
     "read_values", "find_string", "module_base",
     "pointer_chain", "freeze_value", "unfreeze_value", "list_freezes",
     "dump_memory", "scan_rva", "find_instructions", "run_lua", "trace_watchpoint",
-    "thread_suspend", "thread_resume", "thread_step",
+    "thread_suspend", "thread_resume", "thread_step", "list_threads", "set_register",
   ];
   for (const t of expected) {
     check(`tool registered: ${t}`, toolNames.includes(t));
@@ -103,6 +103,12 @@ const run = async () => {
   const mapList = JSON.parse(maps.result?.content?.[0]?.text || "[]");
   console.log("First dalvik map:", mapList[0]);
   check("list_maps returns dalvik maps", mapList.length > 0 && typeof mapList[0].start === "string");
+
+  console.log(`\n=== 3b. list_threads for PID ${pid} ===`);
+  const threadsRes = await callTool("list_threads", { pid });
+  const threadsData = JSON.parse(threadsRes.result?.content?.[0]?.text || "{}");
+  console.log(`Found ${threadsData.threads_count} threads, first:`, threadsData.threads?.[0]);
+  check("list_threads returns threads array", Array.isArray(threadsData.threads) && threadsData.threads.length > 0);
 
   // Do NOT probe a mapping's base. dalvik-main is a 512 MB reservation whose
   // first pages are not resident, so hmkpm correctly answers EFAULT there.

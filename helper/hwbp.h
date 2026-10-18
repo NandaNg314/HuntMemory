@@ -55,4 +55,10 @@ int cmd_thread_resume(int pid, int tid);
 // 4. Single-step target thread N instructions
 int cmd_step(int pid, int tid, int steps);
 
+// 5. List all threads in target process
+int cmd_list_threads(int pid);
+
+// 6. Set register value in target thread
+int cmd_set_register(int pid, int tid, const char *reg_name, uint64_t val);
+
 #endif // HWBP_H

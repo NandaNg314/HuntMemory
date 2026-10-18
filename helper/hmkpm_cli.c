@@ -3410,6 +3410,8 @@ int main(int argc, char **argv) {
                "  thread_suspend <pid> [tid]\n"
                "  thread_resume  <pid> [tid]\n"
                "  step           <pid> [tid] [count]\n"
+               "  threads        <pid>\n"
+               "  set_reg        <pid> <tid> <reg> <val>\n"
                "\n"
                "Value freezing (detached daemon):\n"
                "  freeze_add    <pid> <type> <value> <interval_ms> [addr ...]  (no addr = use scan session)\n"
@@ -3561,6 +3563,12 @@ int main(int argc, char **argv) {
         int tid = argc >= 4 ? atoi(argv[3]) : 0;
         int steps = argc >= 5 ? atoi(argv[4]) : 1;
         return cmd_step(pid, tid, steps);
+    } else if (strcmp(cmd, "threads") == 0 && argc >= 3) {
+        // threads <pid>
+        return cmd_list_threads(atoi(argv[2]));
+    } else if (strcmp(cmd, "set_reg") == 0 && argc >= 6) {
+        // set_reg <pid> <tid> <reg> <val>
+        return cmd_set_register(atoi(argv[2]), atoi(argv[3]), argv[4], strtoull(argv[5], NULL, 0));
     } else if (strcmp(cmd, "run_lua") == 0 && argc >= 4) {
         // run_lua <pid> <script_path|-> [timeout_s]
         return cmd_run_lua(atoi(argv[2]), argv[3],

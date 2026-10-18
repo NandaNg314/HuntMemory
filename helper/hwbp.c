@@ -953,3 +953,203 @@ int cmd_step(int pid, int tid, int steps) {
     vma_table_free(&vmas);
     return 0;
 }
+
+// ---------------------------------------------------------------------------
+// 5. List all threads in target process
+// ---------------------------------------------------------------------------
+int cmd_list_threads(int pid) {
+    if (pid <= 0) {
+        printf("{\"status\":\"error\",\"message\":\"Invalid PID\"}\n");
+        return 1;
+    }
+    char task_dir[64];
+    snprintf(task_dir, sizeof(task_dir), "/proc/%d/task", pid);
+    DIR *d = opendir(task_dir);
+    if (!d) {
+        printf("{\"status\":\"error\",\"message\":\"Cannot open task dir for PID %d\",\"errno\":%d}\n", pid, errno);
+        return 1;
+    }
+
+    struct thread_info {
+        int tid;
+        char name[64];
+        char state[16];
+    };
+    int cap = 128;
+    int count = 0;
+    struct thread_info *list = (struct thread_info *)malloc(sizeof(struct thread_info) * cap);
+
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] >= '0' && de->d_name[0] <= '9') {
+            int tid = atoi(de->d_name);
+            if (tid <= 0) continue;
+            if (count >= cap) {
+                cap *= 2;
+                list = (struct thread_info *)realloc(list, sizeof(struct thread_info) * cap);
+            }
+            list[count].tid = tid;
+            list[count].name[0] = '\0';
+            list[count].state[0] = '\0';
+
+            char comm_path[80];
+            snprintf(comm_path, sizeof(comm_path), "/proc/%d/task/%d/comm", pid, tid);
+            int fd = open(comm_path, O_RDONLY);
+            if (fd >= 0) {
+                ssize_t n = read(fd, list[count].name, sizeof(list[count].name) - 1);
+                if (n > 0) {
+                    list[count].name[n] = '\0';
+                    char *nl = strchr(list[count].name, '\n');
+                    if (nl) *nl = '\0';
+                }
+                close(fd);
+            }
+
+            char stat_path[80];
+            snprintf(stat_path, sizeof(stat_path), "/proc/%d/task/%d/stat", pid, tid);
+            fd = open(stat_path, O_RDONLY);
+            if (fd >= 0) {
+                char sbuf[256];
+                ssize_t n = read(fd, sbuf, sizeof(sbuf) - 1);
+                if (n > 0) {
+                    sbuf[n] = '\0';
+                    char *rparen = strrchr(sbuf, ')');
+                    if (rparen && *(rparen + 1) == ' ' && *(rparen + 2)) {
+                        list[count].state[0] = *(rparen + 2);
+                        list[count].state[1] = '\0';
+                    }
+                }
+                close(fd);
+            }
+            if (!list[count].state[0]) strcpy(list[count].state, "?");
+            count++;
+        }
+    }
+    closedir(d);
+
+    printf("{\n"
+           "  \"status\": \"ok\",\n"
+           "  \"pid\": %d,\n"
+           "  \"threads_count\": %d,\n"
+           "  \"threads\": [\n", pid, count);
+
+    for (int i = 0; i < count; i++) {
+        char esc_name[128];
+        int k = 0;
+        for (int j = 0; list[i].name[j] && k < 120; j++) {
+            if (list[i].name[j] == '"' || list[i].name[j] == '\\') {
+                esc_name[k++] = '\\';
+            }
+            esc_name[k++] = list[i].name[j];
+        }
+        esc_name[k] = '\0';
+
+        printf("    {\"tid\": %d, \"name\": \"%s\", \"state\": \"%s\"}%s\n",
+               list[i].tid, esc_name, list[i].state, (i + 1 == count) ? "" : ",");
+    }
+
+    printf("  ]\n}\n");
+    free(list);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// 6. Set register value in target thread
+// ---------------------------------------------------------------------------
+int cmd_set_register(int pid, int tid, const char *reg_name, uint64_t val) {
+    if (pid <= 0 || !reg_name) {
+        printf("{\"status\":\"error\",\"message\":\"Invalid PID or register name\"}\n");
+        return 1;
+    }
+    pid_t target_tid = (tid > 0) ? tid : pid;
+
+    bool need_detach = false;
+    if (ptrace(PTRACE_ATTACH, target_tid, NULL, NULL) == 0) {
+        need_detach = true;
+        int status = 0;
+        waitpid(target_tid, &status, 0);
+    }
+
+    struct user_pt_regs regs;
+    struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
+    if (ptrace(PTRACE_GETREGSET, target_tid, (void *)(uintptr_t)NT_PRSTATUS, &iov) != 0) {
+        printf("{\"status\":\"error\",\"message\":\"Failed to get registers\",\"errno\":%d}\n", errno);
+        if (need_detach) ptrace(PTRACE_DETACH, target_tid, NULL, (void *)0);
+        return 1;
+    }
+
+    uint64_t old_val = 0;
+    bool matched = false;
+    char canon_reg[16] = "";
+
+    if (strcasecmp(reg_name, "pc") == 0) {
+        old_val = regs.pc;
+        regs.pc = val;
+        matched = true;
+        strcpy(canon_reg, "PC");
+    } else if (strcasecmp(reg_name, "sp") == 0) {
+        old_val = regs.sp;
+        regs.sp = val;
+        matched = true;
+        strcpy(canon_reg, "SP");
+    } else if (strcasecmp(reg_name, "lr") == 0) {
+        old_val = regs.regs[30];
+        regs.regs[30] = val;
+        matched = true;
+        strcpy(canon_reg, "LR");
+    } else if (strcasecmp(reg_name, "fp") == 0) {
+        old_val = regs.regs[29];
+        regs.regs[29] = val;
+        matched = true;
+        strcpy(canon_reg, "FP");
+    } else if (strcasecmp(reg_name, "pstate") == 0) {
+        old_val = regs.pstate;
+        regs.pstate = val;
+        matched = true;
+        strcpy(canon_reg, "PSTATE");
+    } else if ((reg_name[0] == 'x' || reg_name[0] == 'X') && reg_name[1] >= '0' && reg_name[1] <= '9') {
+        int r = atoi(reg_name + 1);
+        if (r >= 0 && r <= 30) {
+            old_val = regs.regs[r];
+            regs.regs[r] = val;
+            matched = true;
+            snprintf(canon_reg, sizeof(canon_reg), "X%d", r);
+        }
+    } else if ((reg_name[0] == 'w' || reg_name[0] == 'W') && reg_name[1] >= '0' && reg_name[1] <= '9') {
+        int r = atoi(reg_name + 1);
+        if (r >= 0 && r <= 30) {
+            old_val = (uint32_t)regs.regs[r];
+            regs.regs[r] = (uint32_t)val;
+            matched = true;
+            snprintf(canon_reg, sizeof(canon_reg), "W%d", r);
+        }
+    }
+
+    if (!matched) {
+        printf("{\"status\":\"error\",\"message\":\"Unknown register name: %s\"}\n", reg_name);
+        if (need_detach) ptrace(PTRACE_DETACH, target_tid, NULL, (void *)0);
+        return 1;
+    }
+
+    if (ptrace(PTRACE_SETREGSET, target_tid, (void *)(uintptr_t)NT_PRSTATUS, &iov) != 0) {
+        printf("{\"status\":\"error\",\"message\":\"Failed to set register\",\"errno\":%d}\n", errno);
+        if (need_detach) ptrace(PTRACE_DETACH, target_tid, NULL, (void *)0);
+        return 1;
+    }
+
+    if (need_detach) {
+        ptrace(PTRACE_DETACH, target_tid, NULL, (void *)0);
+    }
+
+    printf("{\n"
+           "  \"status\": \"ok\",\n"
+           "  \"pid\": %d,\n"
+           "  \"tid\": %d,\n"
+           "  \"register\": \"%s\",\n"
+           "  \"old_value\": \"0x%llx\",\n"
+           "  \"new_value\": \"0x%llx\"\n"
+           "}\n",
+           pid, target_tid, canon_reg,
+           (unsigned long long)old_val, (unsigned long long)val);
+    return 0;
+}
