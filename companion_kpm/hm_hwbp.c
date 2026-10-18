@@ -1,193 +1,180 @@
-#include <linux/types.h>
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * KernelPatch Module (KPM) - [hm_hwbp]
+ * Hardware Breakpoint Companion Module for hmkpm-mcp
+ */
 
-// Minimal types for KernelPatch C module
-typedef unsigned long long u64;
-typedef unsigned int u32;
-typedef int s32;
-typedef unsigned short u16;
-typedef unsigned char u8;
+#include <asm/current.h>
+#include <common.h>
+#include <compiler.h>
+#include <hook.h>
+#include <kconfig.h>
+#include <kpmodule.h>
+#include <kputils.h>
+#include <ksyms.h>
+#include <ktypes.h>
+#include <linux/kernel.h>
+#include <linux/printk.h>
+#include <syscall.h>
+#include <uapi/asm-generic/unistd.h>
+
+#define HM_HWBP_VERSION_STR "1.0.0"
+
+KPM_NAME("hm_hwbp");
+KPM_VERSION(HM_HWBP_VERSION_STR);
+KPM_LICENSE("GPL v2");
+KPM_AUTHOR("hmkpm-mcp");
+KPM_DESCRIPTION("KernelPatch Hardware Breakpoint Module");
 
 #define HMBP_MAGIC             0x484D4250ULL  // "HMBP" ASCII
 #define HMBP_MAGIC_START       (HMBP_MAGIC + 1)
 #define HMBP_MAGIC_POLL        (HMBP_MAGIC + 2)
 #define HMBP_MAGIC_STOP        (HMBP_MAGIC + 3)
 
-#define SYS_GETRESGID 150
-
 struct hmbp_probe_info {
-    u64 magic;
-    u32 version;
-    u32 features;
+    uint64_t magic;
+    uint32_t version;
+    uint32_t features;
     char version_str[16];
 };
 
 struct hmbp_req {
-    s32 pid;
-    u32 access_type; // 1=read, 2=write, 3=rw
-    u64 addr;
-    u32 size;
-    u32 max_hits;
-    u32 duration_ms;
+    int32_t pid;
+    uint32_t access_type; // 1=read, 2=write, 3=rw, 4=exec
+    uint64_t addr;
+    uint32_t size;
+    uint32_t max_hits;
+    uint32_t duration_ms;
 };
 
 struct hmbp_hit_record {
-    u64 timestamp_ms;
-    u32 tid;
-    u32 access_type;
-    u64 pc;
-    u64 lr;
-    u64 sp;
-    u64 pstate;
-    u64 regs[31];
-    u32 insn;
+    uint64_t timestamp_ms;
+    uint32_t tid;
+    uint32_t access_type;
+    uint64_t pc;
+    uint64_t lr;
+    uint64_t sp;
+    uint64_t pstate;
+    uint64_t regs[31];
+    uint32_t insn;
 };
 
-// KernelPatch SDK declarations
-extern unsigned long kallsyms_lookup_name(const char *name);
-extern int hook_syscalln_override(int sysno, int nargs, void *hook_fn, void **orig_fn);
-extern int unhook_syscalln(int sysno);
-extern int printk(const char *fmt, ...);
-extern long compat_copy_to_user(void *dst, const void *src, unsigned long size);
-
-// Function pointer signatures resolved via kallsyms
-struct perf_event;
-struct perf_event_attr;
-struct task_struct;
-struct pt_regs;
-
-typedef void (*perf_overflow_handler_t)(struct perf_event *, void *, struct pt_regs *);
-
-static struct perf_event *(*k_register_user_hw_breakpoint)(
-    struct perf_event_attr *attr,
-    perf_overflow_handler_t triggered,
-    void *context,
-    struct task_struct *tsk) = 0;
-
-static void (*k_unregister_hw_breakpoint)(struct perf_event *bp) = 0;
-static struct task_struct *(*k_find_task_by_vpid)(s32 vpid) = 0;
-
-static void *orig_sys_getresgid = 0;
-
-// Maximum captured events in ring buffer
 #define RING_BUF_MAX 64
 static struct hmbp_hit_record g_hits[RING_BUF_MAX];
-static volatile u32 g_hit_count = 0;
-static volatile s32 g_target_pid = 0;
-static struct perf_event *g_active_bp = 0;
+static volatile uint32_t g_hit_count = 0;
 
-// Hardware watchpoint overflow handler: called in kernel exception context
-static void hwbp_triggered(struct perf_event *bp, void *data, struct pt_regs *regs) {
-    (void)bp;
-    (void)data;
-    if (!regs) return;
-
-    u32 idx = g_hit_count;
-    if (idx < RING_BUF_MAX) {
-        struct hmbp_hit_record *h = &g_hits[idx];
-        // Read PC, LR, SP from pt_regs
-        // In ARM64 pt_regs: regs[0..30], sp, pc, pstate
-        u64 *r = (u64 *)regs;
-        for (int i = 0; i < 31; i++) {
-            h->regs[i] = r[i];
-        }
-        h->sp = r[31];
-        h->pc = r[32];
-        h->pstate = r[33];
-        h->lr = h->regs[30];
-        h->access_type = 2; // Write
-        g_hit_count = idx + 1;
-    }
+void *memset(void *s, int c, size_t count)
+{
+    unsigned char *p = (unsigned char *)s;
+    while (count--)
+        *p++ = (unsigned char)c;
+    return s;
 }
 
-// Hook for syscall 150 (sys_getresgid)
-static long hmbp_syscall_hook(u64 r0, u64 r1, u64 r2, u64 r3, u64 r4, u64 r5) {
-    if (r0 == HMBP_MAGIC) {
-        // Probe info
-        struct hmbp_probe_info info = {
-            .magic = HMBP_MAGIC,
-            .version = 0x010000,
-            .features = 0x1,
-            .version_str = "HMBP-1.0",
-        };
-        if (r1 && r2 >= sizeof(info)) {
-            compat_copy_to_user((void *)r1, &info, sizeof(info));
-            return 0;
-        }
-        return -22; // EINVAL
-    } else if (r0 == HMBP_MAGIC_START) {
-        // Start watchpoint
-        g_hit_count = 0;
-        return 0;
-    } else if (r0 == HMBP_MAGIC_POLL) {
-        // Return hits
-        if (r1 && r2 >= 8) {
-            u32 cnt = g_hit_count;
-            compat_copy_to_user((void *)r1, (void *)&cnt, sizeof(cnt));
-            if (cnt > 0 && r2 >= sizeof(struct hmbp_hit_record) * cnt + 8) {
-                compat_copy_to_user((void *)(r1 + 8), g_hits, sizeof(struct hmbp_hit_record) * cnt);
+static void hmbp_syscall_handle(hook_fargs3_t *args, void *udata)
+{
+    (void)udata;
+    uint64_t magic = syscall_argn(args, 0);
+
+    if (magic != HMBP_MAGIC && magic != HMBP_MAGIC_START &&
+        magic != HMBP_MAGIC_POLL && magic != HMBP_MAGIC_STOP)
+        return;
+
+    uid_t uid = current_uid();
+    if (uid != 0)
+        return;
+
+    args->skip_origin = 1;
+
+    if (magic == HMBP_MAGIC) {
+        void __user *user_ptr = (void __user *)syscall_argn(args, 1);
+        uint64_t total_len = syscall_argn(args, 2);
+
+        if (user_ptr && total_len >= sizeof(struct hmbp_probe_info)) {
+            struct hmbp_probe_info info;
+            memset(&info, 0, sizeof(info));
+            info.magic = HMBP_MAGIC;
+            info.version = 0x010000;
+            info.features = 0x1;
+            const char *vstr = "HMBP-1.0";
+            for (int i = 0; vstr[i] && i < (int)sizeof(info.version_str) - 1; i++) {
+                info.version_str[i] = vstr[i];
             }
-            return (long)cnt;
+            if (compat_copy_to_user(user_ptr, &info, sizeof(info)) == 0) {
+                args->ret = 0;
+                return;
+            }
         }
-        return 0;
-    } else if (r0 == HMBP_MAGIC_STOP) {
-        if (g_active_bp && k_unregister_hw_breakpoint) {
-            k_unregister_hw_breakpoint(g_active_bp);
-            g_active_bp = 0;
+        args->ret = (uint64_t)(long)-EINVAL;
+        return;
+    }
+
+    if (magic == HMBP_MAGIC_START) {
+        g_hit_count = 0;
+        args->ret = 0;
+        return;
+    }
+
+    if (magic == HMBP_MAGIC_POLL) {
+        void __user *user_ptr = (void __user *)syscall_argn(args, 1);
+        uint64_t total_len = syscall_argn(args, 2);
+        if (user_ptr && total_len >= 8) {
+            uint32_t cnt = g_hit_count;
+            if (compat_copy_to_user(user_ptr, &cnt, sizeof(cnt)) == 0) {
+                if (cnt > 0 && total_len >= sizeof(struct hmbp_hit_record) * cnt + 8) {
+                    compat_copy_to_user((void __user *)((uintptr_t)user_ptr + 8),
+                                        g_hits, sizeof(struct hmbp_hit_record) * cnt);
+                }
+                args->ret = cnt;
+                return;
+            }
         }
-        return 0;
+        args->ret = 0;
+        return;
     }
 
-    // Pass through to original system call
-    if (orig_sys_getresgid) {
-        typedef long (*fn_t)(u64, u64, u64, u64, u64, u64);
-        return ((fn_t)orig_sys_getresgid)(r0, r1, r2, r3, r4, r5);
+    if (magic == HMBP_MAGIC_STOP) {
+        args->ret = 0;
+        return;
     }
-    return -38; // ENOSYS
+
+    args->ret = (uint64_t)(long)-EINVAL;
 }
 
-// KernelPatch Module Entry & Exit
-long kpm_init(void) {
-    printk("[+] [HMBP] Initializing Hardware Breakpoint Companion Module\n");
+static long module_init_handler(const char *args, const char *event, void *reserved)
+{
+    (void)args;
+    (void)event;
+    (void)reserved;
 
-    k_register_user_hw_breakpoint = (void *)kallsyms_lookup_name("register_user_hw_breakpoint");
-    k_unregister_hw_breakpoint = (void *)kallsyms_lookup_name("unregister_hw_breakpoint");
-    k_find_task_by_vpid = (void *)kallsyms_lookup_name("find_task_by_vpid");
+    logki("[HMBP] Initializing Hardware Breakpoint Companion Module\n");
 
-    printk("[+] [HMBP] register_user_hw_breakpoint = %px, unregister = %px\n",
-           k_register_user_hw_breakpoint, k_unregister_hw_breakpoint);
-
-    int ret = hook_syscalln_override(SYS_GETRESGID, 3, (void *)hmbp_syscall_hook, &orig_sys_getresgid);
-    if (ret != 0) {
-        printk("[-] [HMBP] hook_syscalln_override failed: %d\n", ret);
-        return ret;
+    hook_err_t err = hook_syscalln_override(__NR_getresgid, 3, (void *)hmbp_syscall_handle, 0, 0);
+    if (err) {
+        logke("[HMBP] hook_syscalln_override error: %d\n", err);
+        return -ENOENT;
     }
 
-    printk("[+] [HMBP] Successfully hooked syscall %d (HMBP_MAGIC=0x%llx)\n",
-           SYS_GETRESGID, HMBP_MAGIC);
+    logki("[HMBP] module loaded successfully (hooked syscall %d)\n", __NR_getresgid);
     return 0;
 }
 
-long kpm_exit(void) {
-    printk("[+] [HMBP] Exiting Hardware Breakpoint Companion Module\n");
-    if (g_active_bp && k_unregister_hw_breakpoint) {
-        k_unregister_hw_breakpoint(g_active_bp);
-        g_active_bp = 0;
-    }
-    unhook_syscalln(SYS_GETRESGID);
+static long module_control_handler(const char *args, char __user *out_msg, int outlen)
+{
+    (void)args;
+    (void)out_msg;
+    (void)outlen;
     return 0;
 }
 
-long kpm_ctl0(void) {
+static long module_cleanup_handler(void *reserved)
+{
+    (void)reserved;
+    unhook_syscalln(__NR_getresgid, (void *)hmbp_syscall_handle, 0);
+    logki("[HMBP] module cleaned up\n");
     return 0;
 }
 
-// KernelPatch metadata sections
-__attribute__((section(".kpm.init"))) void *kpm_init_ptr = (void *)kpm_init;
-__attribute__((section(".kpm.exit"))) void *kpm_exit_ptr = (void *)kpm_exit;
-__attribute__((section(".kpm.ctl0"))) void *kpm_ctl0_ptr = (void *)kpm_ctl0;
-__attribute__((section(".kpm.info"))) const char kpm_info[] =
-    "name=hm_hwbp\0"
-    "version=1.0.0\0"
-    "license=GPL v2\0"
-    "author=hmkpm-mcp\0"
-    "description=HMKPM Hardware Breakpoint Companion Module\0";
+KPM_INIT(module_init_handler);
+KPM_CTL0(module_control_handler);
+KPM_EXIT(module_cleanup_handler);
