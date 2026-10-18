@@ -71,6 +71,7 @@ const run = async () => {
     "read_memory", "read_value", "write_memory", "write_value",
     "scan_kernel",
     "scan_seed", "scan_unknown", "scan_filter", "scan_results", "scan_reset",
+    "read_values", "find_string", "module_base",
   ];
   for (const t of expected) {
     check(`tool registered: ${t}`, toolNames.includes(t));
@@ -191,6 +192,39 @@ const run = async () => {
   console.log("\n=== 12. scan_reset (cleanup) ===");
   const reset1 = await callTool("scan_reset", { pid, type: "i32" });
   check("scan_reset ok", reset1.result?.content?.[0]?.text?.includes("reset"));
+
+  // --- New lookup tools ----------------------------------------------------
+  console.log("\n=== 13. read_values (batch) ===");
+  const batch = await callTool("read_values", { pid, addresses: [readAddr], type: "i32" });
+  const batchText = batch.result?.content?.[0]?.text || "";
+  console.log("read_values:", batchText.slice(0, 200));
+  const batchData = JSON.parse(batchText || "{}");
+  check("read_values returns values[]", Array.isArray(batchData.values) && batchData.values.length === 1);
+  check("read_values marks the slot readable", batchData.values?.[0]?.readable === true);
+
+  console.log("\n=== 14. read_values with an unmapped address ===");
+  const missing = await callTool("read_values", { pid, addresses: ["0x10"], type: "i32" });
+  const missingData = JSON.parse(missing.result?.content?.[0]?.text || "{}");
+  check("read_values flags unreadable slots", missingData.values?.[0]?.readable === false);
+
+  console.log("\n=== 15. find_string ===");
+  const strHit = await callTool("find_string", { pid, pattern: "libc.so", perms: "r--p", limit: 20 });
+  const strText = strHit.result?.content?.[0]?.text || "";
+  console.log("find_string:", strText.slice(0, 200));
+  const strData = JSON.parse(strText || "{}");
+  check("find_string returns matches[]", Array.isArray(strData.matches));
+  check("find_string finds a known library name", (strData.count || 0) > 0);
+
+  console.log("\n=== 16. module_base ===");
+  const mod = await callTool("module_base", { pid, module: "libc.so" });
+  const modText = mod.result?.content?.[0]?.text || "";
+  console.log("module_base:", modText);
+  const modData = JSON.parse(modText || "{}");
+  check("module_base returns a base", typeof modData.base === "string" && modData.base.startsWith("0x"));
+  const modRva = JSON.parse(
+    (await callTool("module_base", { pid, module: "libc.so", rva: 0x1000 })).result?.content?.[0]?.text || "{}",
+  );
+  check("module_base adds the RVA", BigInt(modRva.address) === BigInt(modData.base) + 0x1000n);
 
   await finish();
 };

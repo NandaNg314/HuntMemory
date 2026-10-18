@@ -152,6 +152,30 @@ export class HmkpmTools {
     assertType(type);
     return this.device.invoke(["scan_reset", String(pid), type]);
   }
+
+  // Batch-read many addresses in one CLI call instead of one process each.
+  async readValues({ pid, addresses, type = "i32" }) {
+    assertType(type);
+    const list = (Array.isArray(addresses) ? addresses : [addresses]).map(asHex);
+    if (list.length === 0) throw new Error("addresses must not be empty");
+    if (list.length > 4096) throw new Error("at most 4096 addresses per call");
+    return this.device.invoke(["read_values", String(pid), type, ...list]);
+  }
+
+  // Literal byte-string search across readable memory.
+  async findString({ pid, pattern, perms = "rw-p", limit = 100 }) {
+    if (!pattern) throw new Error("pattern must not be empty");
+    return this.device.invoke([
+      "find_string", String(pid), String(pattern), perms, String(limit),
+    ]);
+  }
+
+  // Load base of a shared object, optionally plus an RVA.
+  async moduleBase({ pid, module, rva }) {
+    const args = ["module_base", String(pid), String(module)];
+    if (rva !== undefined && rva !== null && rva !== "") args.push(asHex(rva));
+    return this.device.invoke(args);
+  }
 }
 
 // The CLI parses numbers with strtol/strtoul base 0 (so "0x.." works) and

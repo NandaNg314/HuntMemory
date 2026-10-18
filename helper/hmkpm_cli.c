@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <math.h>
+#include <fcntl.h>
 
 #define SYS_GETRESUID 148
 
@@ -94,6 +95,16 @@ static void print_error(const char *msg, int err) {
 
 static uint32_t collect_ranges(int pid, const char *perm_req,
                                struct hmkpm_scan_range *ranges, uint32_t max_ranges);
+
+static uint32_t count_ranges(int pid, const char *perm_req);
+
+static struct hmkpm_scan_range *collect_ranges_alloc(int pid, const char *perm_req,
+                                                     uint32_t *count_out);
+
+static bool kernel_scan_ranges(int pid, uint8_t type, uint8_t align, uint64_t criteria_val,
+                               const struct hmkpm_scan_range *ranges, uint32_t range_count,
+                               uint32_t cap, uint64_t *found_out,
+                               uint64_t **matches_out, uint32_t *reported_out);
 
 static int cmd_probe(void) {
     struct hmkpm_version_info info;
@@ -388,36 +399,15 @@ static int cmd_scan(int pid, const char *type_name, const char *val_str, int cus
         align = (uint8_t)custom_align;
     }
 
-    // Collect readable/writable memory ranges from /proc/<pid>/maps
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        print_error("Cannot open maps for scan", errno);
+    // Collect readable/writable memory ranges from /proc/<pid>/maps. Sized to
+    // the process's real VMA count: a fixed cap silently skipped a third of a
+    // large app's address space.
+    uint32_t range_count = 0;
+    struct hmkpm_scan_range *ranges = collect_ranges_alloc(pid, filter_perms, &range_count);
+    if (!ranges && count_ranges(pid, filter_perms) == 0) {
+        printf("{\"status\":\"error\",\"message\":\"Cannot open maps for scan\",\"errno\":%d}\n", EACCES);
         return 1;
     }
-
-    #define MAX_RANGES 1024
-    struct hmkpm_scan_range ranges[MAX_RANGES];
-    uint32_t range_count = 0;
-    char line[512];
-
-    const char *perm_req = filter_perms ? filter_perms : "rw-p";
-
-    while (fgets(line, sizeof(line), f) && range_count < MAX_RANGES) {
-        uint64_t start = 0, end = 0;
-        char perms[8] = {0};
-        int c = sscanf(line, "%llx-%llx %7s", (unsigned long long *)&start, (unsigned long long *)&end, perms);
-        if (c >= 3) {
-            // Check permissions (e.g. must be readable)
-            if (perms[0] == 'r' && (!filter_perms || strstr(perms, perm_req))) {
-                ranges[range_count].start_va = start;
-                ranges[range_count].size = end - start;
-                range_count++;
-            }
-        }
-    }
-    fclose(f);
 
     // Print the envelope BEFORE the scan runs. The kernel reports a match count
     // that can exceed the slot array (it keeps counting while capping writes,
@@ -427,56 +417,116 @@ static int cmd_scan(int pid, const char *type_name, const char *val_str, int cus
     #define MAX_MATCHES 2048
     if (range_count == 0) {
         printf("{\"status\":\"ok\",\"matches_found\":0,\"truncated\":false,\"matches\":[]}\n");
+        free(ranges);
         return 0;
     }
-    size_t ranges_bytes = range_count * sizeof(struct hmkpm_scan_range);
-    size_t matches_bytes = MAX_MATCHES * sizeof(uint64_t);
-    size_t total_len = sizeof(struct hmkpm_scan_hdr) + ranges_bytes + matches_bytes;
 
-    uint8_t *buf = (uint8_t *)calloc(1, total_len);
-    if (!buf) {
-        print_error("Out of memory for scan buffer", ENOMEM);
-        return 1;
-    }
-
-    struct hmkpm_scan_hdr *hdr = (struct hmkpm_scan_hdr *)buf;
-    hdr->pid = pid;
-    hdr->type = scan_type;
-    hdr->op = HMKPM_SCAN_OP_EXACT;
-    hdr->align = align;
-    hdr->range_count = range_count;
-    hdr->max_matches = MAX_MATCHES;
-    hdr->pattern_len = 0;
-    hdr->criteria.exact.val = criteria_val;
-    hdr->criteria.exact.mask = ~0ULL;
-    hdr->matches_found = 0;
-
-    memcpy(buf + sizeof(struct hmkpm_scan_hdr), ranges, ranges_bytes);
-
-    errno = 0;
-    long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_SCAN_KERNEL, buf, total_len);
-    if (ret < 0 && ret != 0) {
+    uint64_t found = 0;
+    uint32_t reported = 0;
+    uint64_t *matches = NULL;
+    if (!kernel_scan_ranges(pid, scan_type, align, criteria_val, ranges, range_count,
+                            MAX_MATCHES, &found, &matches, &reported)) {
         print_error("HMKPM scan kernel syscall failed", errno ? errno : EFAULT);
-        free(buf);
+        free(ranges);
         return 1;
     }
 
-    uint64_t found = hdr->matches_found;
-    uint64_t *matches = (uint64_t *)(buf + sizeof(struct hmkpm_scan_hdr) + ranges_bytes);
-    uint32_t report_count = found > MAX_MATCHES ? MAX_MATCHES : (uint32_t)found;
-
-    // `matches_found` keeps the full kernel count; `matches` is capped (see
-    // "truncated"). Streamed in chunks so a huge count still produces output
-    // the caller sees immediately instead of one delayed multi-megabyte line.
     printf("{\"status\":\"ok\",\"matches_found\":%llu,\"truncated\":%s,\"matches\":[",
            (unsigned long long)found, found > MAX_MATCHES ? "true" : "false");
-    for (uint32_t i = 0; i < report_count; i++) {
+    for (uint32_t i = 0; i < reported; i++) {
         printf("%s\"0x%llx\"", i ? "," : "", (unsigned long long)matches[i]);
         if ((i & 255) == 255) fflush(stdout);
     }
     printf("]}\n");
-    free(buf);
+    free(matches);
+    free(ranges);
     return 0;
+}
+
+// Run HMKPM_OP_EXACT over `ranges`, in batches, and merge the hits.
+//
+// The kernel's fixed-size VMA table rejects a request carrying more ranges than
+// it can hold (E2BIG). A large app like systemui has ~1600 rw-p VMAs, well past
+// that limit, so a single request fails for exactly the apps users care about.
+// Splitting into batches keeps the kernel's NEON path usable instead of falling
+// back to a userspace byte-by-byte scan.
+//
+// Returns false only when a batch fails for a reason other than "too many
+// ranges" (which is handled by halving the batch).
+#define KERNEL_RANGE_BATCH 512
+// Per-request output slot cap. The kernel writes at most this many addresses
+// per call; scan_seed then accumulates hits across batches up to its own cap.
+#define KERNEL_BATCH_HITS 65536
+static bool kernel_scan_ranges(int pid, uint8_t type, uint8_t align, uint64_t criteria_val,
+                               const struct hmkpm_scan_range *ranges, uint32_t range_count,
+                               uint32_t cap, uint64_t *found_out,
+                               uint64_t **matches_out, uint32_t *reported_out) {
+    *found_out = 0;
+    *reported_out = 0;
+    *matches_out = (uint64_t *)malloc(sizeof(uint64_t) * (cap ? cap : 1));
+    if (!*matches_out) return false;
+    uint32_t slot_cap = cap < KERNEL_BATCH_HITS ? cap : KERNEL_BATCH_HITS;
+
+    size_t max_ranges_bytes = (size_t)KERNEL_RANGE_BATCH * sizeof(struct hmkpm_scan_range);
+    size_t matches_bytes = (size_t)slot_cap * sizeof(uint64_t);
+    size_t total_len = sizeof(struct hmkpm_scan_hdr) + max_ranges_bytes + matches_bytes;
+    uint8_t *buf = (uint8_t *)calloc(1, total_len);
+    if (!buf) { free(*matches_out); *matches_out = NULL; return false; }
+
+    struct hmkpm_scan_hdr *hdr = (struct hmkpm_scan_hdr *)buf;
+    uint8_t *slot_base = buf + sizeof(struct hmkpm_scan_hdr) + max_ranges_bytes;
+
+    uint32_t batch = KERNEL_RANGE_BATCH;
+    uint32_t done = 0;
+    while (done < range_count) {
+        uint32_t n = range_count - done;
+        if (n > batch) n = batch;
+
+        memset(hdr, 0, sizeof(*hdr));
+        hdr->pid = pid;
+        hdr->type = type;
+        hdr->op = HMKPM_SCAN_OP_EXACT;
+        hdr->align = align;
+        hdr->range_count = n;
+        // Ask the kernel for at most what one batch can return. Requesting the
+        // full session cap (millions of slots) makes the kernel refuse the
+        // request outright, which is what pushed scan_seed onto the slow
+        // userspace path.
+        hdr->max_matches = cap < KERNEL_BATCH_HITS ? cap : KERNEL_BATCH_HITS;
+        hdr->pattern_len = 0;
+        hdr->criteria.exact.val = criteria_val;
+        hdr->criteria.exact.mask = ~0ULL;
+        hdr->matches_found = 0;
+        memcpy(buf + sizeof(struct hmkpm_scan_hdr), ranges + done,
+               (size_t)n * sizeof(struct hmkpm_scan_range));
+
+        errno = 0;
+        long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_SCAN_KERNEL, buf,
+                           sizeof(struct hmkpm_scan_hdr) + (size_t)n * sizeof(struct hmkpm_scan_range) + matches_bytes);
+        if (ret < 0 && ret != 0) {
+            // errno 7 (E2BIG on arm64) means the kernel's range table is still
+            // full; shrink the batch and retry the same slice.
+            if (errno == E2BIG && n > 1) { batch = n / 2; continue; }
+            free(buf);
+            free(*matches_out);
+            *matches_out = NULL;
+            if (errno != E2BIG) errno = errno ? errno : EFAULT;
+            return false;
+        }
+
+        uint64_t hits = hdr->matches_found;
+        *found_out += hits;
+        uint64_t *src = (uint64_t *)slot_base;
+        uint32_t take = hits > slot_cap ? slot_cap : (uint32_t)hits;
+        for (uint32_t i = 0; i < take && *reported_out < cap; i++) {
+            (*matches_out)[(*reported_out)++] = src[i];
+        }
+        done += n;
+        batch = KERNEL_RANGE_BATCH;            // restore full batch on success
+    }
+
+    free(buf);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -623,43 +673,85 @@ static int entry_equals_value(const struct scan_entry *e, uint8_t type, double t
 static int session_save(int pid, const char *type_name, struct scan_session *s) {
     char path[128];
     session_path(path, sizeof(path), pid, type_name);
-    FILE *f = fopen(path, "wb");
-    if (!f) return -1;
-    uint32_t magic = 0x484D4B53; // "HMKS"
-    fwrite(&magic, sizeof(magic), 1, f);
-    fwrite(&s->pid, sizeof(s->pid), 1, f);
-    fwrite(&s->type, sizeof(s->type), 1, f);
-    fwrite(&s->elem_size, sizeof(s->elem_size), 1, f);
-    fwrite(&s->count, sizeof(s->count), 1, f);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+
+    // One write for the header and one for the whole entry array: fwrite() on a
+    // 60 MB session did millions of buffered copies. Entries are already a
+    // contiguous array, so a single writev-style syscall pair is enough.
+    struct {
+        uint32_t magic;
+        int32_t  pid;
+        uint8_t  type;
+        uint8_t  elem_size;
+        uint32_t count;
+    } hdr;
+    hdr.magic = 0x484D4B53; // "HMKS"
+    hdr.pid = s->pid;
+    hdr.type = s->type;
+    hdr.elem_size = s->elem_size;
+    hdr.count = s->count;
+
+    if (write(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr)) { close(fd); return -1; }
     if (s->count > 0 && s->entries) {
-        fwrite(s->entries, sizeof(struct scan_entry), s->count, f);
+        size_t bytes = sizeof(struct scan_entry) * (size_t)s->count;
+        const uint8_t *p = (const uint8_t *)s->entries;
+        while (bytes > 0) {
+            ssize_t n = write(fd, p, bytes);
+            if (n <= 0) { close(fd); return -1; }
+            p += n;
+            bytes -= (size_t)n;
+        }
     }
-    fclose(f);
+    close(fd);
     return 0;
 }
 
 static int session_load(int pid, const char *type_name, struct scan_session *s) {
     char path[128];
     session_path(path, sizeof(path), pid, type_name);
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-    uint32_t magic = 0;
-    if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != 0x484D4B53) {
-        fclose(f);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+
+    // The session is read start-to-finish exactly once; telling the kernel that
+    // lets it skip aggressive readahead tuning and drop pages behind us.
+    posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+    struct {
+        uint32_t magic;
+        int32_t  pid;
+        uint8_t  type;
+        uint8_t  elem_size;
+        uint32_t count;
+    } hdr;
+    if (read(fd, &hdr, sizeof(hdr)) != (ssize_t)sizeof(hdr) || hdr.magic != 0x484D4B53) {
+        close(fd);
         return -1;
     }
-    if (fread(&s->pid, sizeof(s->pid), 1, f) != 1) { fclose(f); return -1; }
-    if (fread(&s->type, sizeof(s->type), 1, f) != 1) { fclose(f); return -1; }
-    if (fread(&s->elem_size, sizeof(s->elem_size), 1, f) != 1) { fclose(f); return -1; }
-    if (fread(&s->count, sizeof(s->count), 1, f) != 1) { fclose(f); return -1; }
+    s->pid = hdr.pid;
+    s->type = hdr.type;
+    s->elem_size = hdr.elem_size;
+    s->count = hdr.count;
+
     s->entries = NULL;
     if (s->count > 0) {
-        s->entries = (struct scan_entry *)malloc(sizeof(struct scan_entry) * s->count);
-        if (!s->entries) { fclose(f); return -1; }
-        size_t got = fread(s->entries, sizeof(struct scan_entry), s->count, f);
-        if (got != s->count) { fclose(f); free(s->entries); s->entries = NULL; return -1; }
+        size_t bytes = sizeof(struct scan_entry) * (size_t)s->count;
+        s->entries = (struct scan_entry *)malloc(bytes);
+        if (!s->entries) { close(fd); return -1; }
+        uint8_t *p = (uint8_t *)s->entries;
+        size_t left = bytes;
+        while (left > 0) {
+            ssize_t n = read(fd, p, left);
+            if (n <= 0) break;
+            p += n;
+            left -= (size_t)n;
+        }
+        if (left != 0) {
+            // Truncated session (killed mid-write): trust only what we got.
+            s->count = (uint32_t)((bytes - left) / sizeof(struct scan_entry));
+        }
     }
-    fclose(f);
+    close(fd);
     return 0;
 }
 
@@ -671,86 +763,75 @@ static void session_free(struct scan_session *s) {
 // (Single-address reads go through read_many below: a per-candidate syscall
 // loop over millions of addresses is far too slow for a filter pass.)
 
-// Re-read a run of addresses in as few syscalls as possible. `out` receives
-// size bytes per address; unreadable slots stay zero-filled and are reported
-// through the optional `live` bitmap (1 = the kernel returned the bytes).
-// Addresses are handled in windows of at most 4096 slots; a window that the
-// kernel refuses (EFAULT, one guard page anywhere in it) is halved until the
-// failure is isolated to a single slot, so a stale address costs a handful of
-// syscalls instead of aborting the whole pass.
+// Re-read a run of addresses in as few syscalls as possible.
+//
+// HMKPM_READ copies a CONTIGUOUS span, so a batch is only valid when the
+// addresses inside it are contiguous. Filter candidates are dense inside a
+// mapping (a scan walks every aligned slot) but sparse across mappings and
+// broken by unreadable pages. Batching therefore happens per PAGE: all
+// candidates falling inside one page are served by a single read of that page,
+// which is both exact and cheap (one syscall per 4 KiB instead of per slot).
+//
+// `live` (optional) marks the slots the kernel actually returned so callers can
+// distinguish a real zero from a dropped slot.
 static void read_many(int pid, const uint64_t *addrs, uint32_t n, uint8_t size,
                       uint8_t *out, uint32_t *ok_count, uint8_t *live) {
     *ok_count = 0;
     if (live) memset(live, 0, n);
     if (n == 0) return;
 
-    // Request header lives in the stack buffer so the kernel's copy_to_user
-    // targets this frame; page faults inside it then degrade to a zero return.
     struct {
         struct hmkpm_req req;
         uint8_t scratch[4096];
     } buf;
     buf.req.pid = pid;
 
-    // A single-address HMKPM_READ returns EFAULT both for "target page not
-    // readable" and for "kernel never wrote our bytes" (copy_to_user failing
-    // on our own guard page), so one exact read cannot be trusted. Fall back to
-    // reading a page-aligned span of the target and picking the bytes out of
-    // it, which only fails when the target memory itself is unreadable.
-    if (n == 1) {
-        uint64_t start = addrs[0] & ~0xFFFULL;
-        size_t off = (size_t)(addrs[0] - start);
-        if (off + size > sizeof(buf.scratch)) {
-            memset(out, 0, size);
-            return;
-        }
-        buf.req.addr = start;
+    uint32_t i = 0;
+    while (i < n) {
+        uint64_t page = addrs[i] & ~0xFFFULL;
+
+        // Collect every candidate that lives in this page. Candidate lists are
+        // address-ordered, so this is a simple forward scan.
+        uint32_t start = i;
+        while (i < n && (addrs[i] & ~0xFFFULL) == page) i++;
+        uint32_t end = i;                       // exclusive
+
+        // Whole-page read: the kernel returns the page's 4096 bytes and each
+        // candidate is sliced out of it.
+        buf.req.addr = page;
         buf.req.size = sizeof(buf.scratch);
         errno = 0;
         long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_READ, &buf,
                            sizeof(struct hmkpm_req) + sizeof(buf.scratch));
-        if (ret >= 0 || ret == 0) {
-            memcpy(out, buf.scratch + off, size);
-            if (live) live[0] = 1;
-            *ok_count = 1;
-        } else {
-            memset(out, 0, size);
+        if (ret < 0 && ret != 0) {
+            // Page not readable: try a partial read ending at the last
+            // candidate, which still succeeds for a page whose tail is the
+            // unreadable part.
+            uint64_t last = addrs[end - 1] + size - page;
+            if (last <= sizeof(buf.scratch)) {
+                buf.req.size = (size_t)last;
+                errno = 0;
+                ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_READ, &buf,
+                              sizeof(struct hmkpm_req) + last);
+            }
         }
-        return;
-    }
+        if (ret < 0 && ret != 0) continue;       // whole page gone, leave zeroed
 
-    const uint32_t CH = 4096;                       // max addresses per syscall
-    uint32_t done = 0;
-    while (done < n) {
-        uint32_t chunk = (n - done) < CH ? (n - done) : CH;
-        if ((size_t)chunk * size > sizeof(buf.scratch)) chunk = 1;
-        while (chunk > 0) {
-            size_t bytes = (size_t)chunk * size;
-            buf.req.addr = addrs[done];
-            buf.req.size = bytes;
-            errno = 0;
-            long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_READ, &buf,
-                               sizeof(struct hmkpm_req) + bytes);
-            if (ret >= 0 || ret == 0) {
-                memcpy(out + (size_t)done * size, buf.scratch, bytes);
-                if (live) memset(live + done, 1, chunk);
-                *ok_count += chunk;
-                done += chunk;
-                break;
-            }
-            if (chunk == 1) {
-                // Unreadable slot: leave it zeroed and move on. Without the
-                // bitmap callers only see zeros, which is why stale addresses
-                // look like "changed from old value to 0".
-                done += 1;
-                break;
-            }
-            chunk /= 2;                            // narrow around the bad slot
+        size_t avail = buf.req.size;
+        for (uint32_t k = start; k < end; k++) {
+            size_t off = (size_t)(addrs[k] - page);
+            if (off + size > avail) continue;
+            memcpy(out + (size_t)k * size, buf.scratch + off, size);
+            if (live) live[k] = 1;
+            (*ok_count)++;
         }
     }
 }
 
 // Collect readable ranges (matches the semantics used by cmd_scan).
+// `max_ranges` caps the returned count; pass 0 for "as many as fit".
+// A large app (systemui) has ~1600 rw-p VMAs, so the old fixed 1024-slot
+// stack array silently skipped a third of the address space.
 static uint32_t collect_ranges(int pid, const char *perm_req,
                                struct hmkpm_scan_range *ranges, uint32_t max_ranges) {
     char path[64];
@@ -760,7 +841,8 @@ static uint32_t collect_ranges(int pid, const char *perm_req,
     char line[512];
     uint32_t range_count = 0;
     const char *pr = perm_req ? perm_req : "rw-p";
-    while (fgets(line, sizeof(line), f) && range_count < max_ranges) {
+    while (fgets(line, sizeof(line), f)) {
+        if (max_ranges && range_count >= max_ranges) break;
         uint64_t start = 0, end = 0;
         char perms[8] = {0};
         int c = sscanf(line, "%llx-%llx %7s", (unsigned long long *)&start, (unsigned long long *)&end, perms);
@@ -776,6 +858,41 @@ static uint32_t collect_ranges(int pid, const char *perm_req,
     return range_count;
 }
 
+// Count how many VMAs match, without storing them, so callers can allocate the
+// exact number of slots instead of guessing a cap.
+static uint32_t count_ranges(int pid, const char *perm_req) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[512];
+    uint32_t n = 0;
+    const char *pr = perm_req ? perm_req : "rw-p";
+    while (fgets(line, sizeof(line), f)) {
+        uint64_t start = 0, end = 0;
+        char perms[8] = {0};
+        if (sscanf(line, "%llx-%llx %7s", (unsigned long long *)&start, (unsigned long long *)&end, perms) >= 3) {
+            if (perms[0] == 'r' && (!perm_req || strstr(perms, pr))) n++;
+        }
+    }
+    fclose(f);
+    return n;
+}
+
+// Allocate a range array sized to the process's actual VMA count and fill it.
+// Returns NULL when the process has no matching mapping.
+static struct hmkpm_scan_range *collect_ranges_alloc(int pid, const char *perm_req,
+                                                     uint32_t *count_out) {
+    *count_out = 0;
+    uint32_t n = count_ranges(pid, perm_req);
+    if (n == 0) return NULL;
+    struct hmkpm_scan_range *ranges =
+        (struct hmkpm_scan_range *)malloc(sizeof(struct hmkpm_scan_range) * n);
+    if (!ranges) return NULL;
+    *count_out = collect_ranges(pid, perm_req, ranges, n);
+    return ranges;
+}
+
 // First pass: find ALL locations whose raw bytes have no fixed value -- i.e.
 // the "unknown initial value" scan. We snapshot every aligned slot, storing
 // address + current value. This produces a large candidate set which later
@@ -786,10 +903,10 @@ static int cmd_scan_unknown(int pid, const char *type_name, int custom_align, co
     if (type == 0) { print_error("Invalid scan type", EINVAL); return 1; }
     if (custom_align > 0) align = (uint8_t)custom_align;
 
-    uint32_t max_ranges = 1024;
-    struct hmkpm_scan_range ranges[1024];
-    uint32_t range_count = collect_ranges(pid, filter_perms, ranges, max_ranges);
+    uint32_t range_count = 0;
+    struct hmkpm_scan_range *ranges = collect_ranges_alloc(pid, filter_perms, &range_count);
     if (range_count == 0) {
+        free(ranges);
         printf("{\"status\":\"ok\",\"count\":0}\n");
         return 0;
     }
@@ -974,46 +1091,28 @@ static int cmd_scan_seed(int pid, const char *type_name, const char *val_str, in
     // an empty session makes the feature useless. Keep a usable slice.
     uint32_t cap = session_max();
     uint64_t found = 0;
-    uint32_t max_ranges = 1024;
-    struct hmkpm_scan_range ranges[1024];
-    uint32_t range_count = collect_ranges(pid, filter_perms, ranges, max_ranges);
+    uint32_t range_count = 0;
+    struct hmkpm_scan_range *ranges = collect_ranges_alloc(pid, filter_perms, &range_count);
     if (range_count == 0) {
+        free(ranges);
         printf("{\"status\":\"ok\",\"pid\":%d,\"type\":\"%s\",\"count\":0,\"matches_found\":0}\n",
                pid, type_name);
         return 0;
     }
 
-    size_t ranges_bytes = range_count * sizeof(struct hmkpm_scan_range);
-    size_t total_len = sizeof(struct hmkpm_scan_hdr) + ranges_bytes + (size_t)cap * sizeof(uint64_t);
-    uint8_t *buf = (uint8_t *)calloc(1, total_len);
-    if (!buf) { print_error("Out of memory for seed scan", ENOMEM); return 1; }
-
-    struct hmkpm_scan_hdr *hdr = (struct hmkpm_scan_hdr *)buf;
-    hdr->pid = pid;
-    hdr->type = type;
-    hdr->op = HMKPM_SCAN_OP_EXACT;
-    hdr->align = align;
-    hdr->range_count = range_count;
-    hdr->max_matches = cap;
-    hdr->pattern_len = 0;
-    hdr->criteria.exact.val = criteria_val;
-    hdr->criteria.exact.mask = ~0ULL;
-    hdr->matches_found = 0;
-    memcpy(buf + sizeof(struct hmkpm_scan_hdr), ranges, ranges_bytes);
-
-    errno = 0;
-    long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_SCAN_KERNEL, buf, total_len);
-    if (ret < 0 && ret != 0) {
-        // errno 7 (E2BIG on arm64) is what hmkpm returns when the request
-        // carries more VMAs than its fixed-size range table — i.e. any big
-        // modern app (systemui alone has ~6400 maps). Fall back to a userspace
-        // exact scan over the same ranges: slower, but unbounded.
-        free(buf);
+    uint32_t reported = 0;
+    uint64_t *matches = NULL;
+    if (!kernel_scan_ranges(pid, type, align, criteria_val, ranges, range_count,
+                            cap, &found, &matches, &reported)) {
+        // Batching already handles the oversized-VMA case, so a failure here is
+        // genuinely fatal for the kernel path. Keep the userspace scan as a
+        // last resort for older kernels that reject the request for other
+        // reasons.
+        free(ranges);
         return scan_exact_userspace(pid, type_name, type, elem_size, align,
                                     criteria_val, filter_perms, cap);
     }
-    found = hdr->matches_found;
-    uint64_t *matches = (uint64_t *)(buf + sizeof(struct hmkpm_scan_hdr) + ranges_bytes);
+    free(ranges);
     uint64_t kept = found < cap ? found : cap;
 
     // Everything the kernel matched holds `criteria_val`, so the hit list *is*
@@ -1026,7 +1125,7 @@ static int cmd_scan_seed(int pid, const char *type_name, const char *val_str, in
     sess.elem_size = elem_size;
     sess.count = 0;
     sess.entries = (struct scan_entry *)malloc(sizeof(struct scan_entry) * (kept ? kept : 1));
-    if (!sess.entries) { print_error("Out of memory", ENOMEM); free(buf); return 1; }
+    if (!sess.entries) { print_error("Out of memory", ENOMEM); free(matches); return 1; }
     for (uint64_t i = 0; i < kept; i++) {
         struct scan_entry *e = &sess.entries[sess.count];
         e->addr = matches[i];
@@ -1034,7 +1133,7 @@ static int cmd_scan_seed(int pid, const char *type_name, const char *val_str, in
         memcpy(&e->val, &criteria_val, elem_size);
         sess.count++;
     }
-    free(buf);
+    free(matches);
 
     session_save(pid, type_name, &sess);
     uint32_t n = sess.count;
@@ -1079,6 +1178,28 @@ static int cmd_scan_filter(int pid, const char *type_name, const char *mode, con
 
     uint32_t kept_n = 0;
 
+    // Resolve the predicate ONCE. Comparing mode strings inside the loop meant
+    // up to 8 strcmp() calls per candidate, i.e. tens of millions of string
+    // comparisons on a 4M-entry session.
+    enum { M_CHANGED, M_UNCHANGED, M_INCREASED, M_DECREASED,
+           M_GT, M_LT, M_EQ, M_NE, M_RANGE } m;
+    if      (strcmp(mode, "changed") == 0)   m = M_CHANGED;
+    else if (strcmp(mode, "unchanged") == 0) m = M_UNCHANGED;
+    else if (strcmp(mode, "increased") == 0) m = M_INCREASED;
+    else if (strcmp(mode, "decreased") == 0) m = M_DECREASED;
+    else if (strcmp(mode, "gt") == 0)        m = M_GT;
+    else if (strcmp(mode, "lt") == 0)        m = M_LT;
+    else if (strcmp(mode, "eq") == 0)        m = M_EQ;
+    else if (strcmp(mode, "ne") == 0)        m = M_NE;
+    else if (strcmp(mode, "range") == 0)     m = M_RANGE;
+    else {
+        free(raw); free(kept); session_free(&sess);
+        print_error("Unknown filter mode", EINVAL);
+        return 1;
+    }
+    double lo = 0, hi = 0;
+    if (m == M_RANGE) sscanf(arg, "%lf:%lf", &lo, &hi);
+
     for (uint32_t i = 0; i < sess.count; i++) {
         struct scan_entry cur;
         uint8_t *slot = raw + (size_t)i * sess.elem_size;
@@ -1088,34 +1209,20 @@ static int cmd_scan_filter(int pid, const char *type_name, const char *mode, con
         int old_vs_new = compare_entries(&sess.entries[i], &cur, type); // old - new
         bool keep = false;
 
-        if (strcmp(mode, "changed") == 0) {
-            keep = (old_vs_new != 0);
-        } else if (strcmp(mode, "unchanged") == 0) {
-            keep = (old_vs_new == 0);
-        } else if (strcmp(mode, "increased") == 0) {
-            keep = (old_vs_new < 0); // old < new
-        } else if (strcmp(mode, "decreased") == 0) {
-            keep = (old_vs_new > 0); // old > new
-        } else if (strcmp(mode, "gt") == 0) {
-            keep = (entry_as_double(&cur, type) > target);
-        } else if (strcmp(mode, "lt") == 0) {
-            keep = (entry_as_double(&cur, type) < target);
-        } else if (strcmp(mode, "eq") == 0) {
-            keep = entry_equals_value(&cur, type, target) == 0;
-        } else if (strcmp(mode, "ne") == 0) {
-            keep = entry_equals_value(&cur, type, target) != 0;
-        } else if (strcmp(mode, "range") == 0) {
-            // arg = "min:max"
-            double lo = 0, hi = 0;
-            sscanf(arg, "%lf:%lf", &lo, &hi);
-            double d = entry_as_double(&cur, type);
-            keep = (d >= lo && d <= hi);
-        } else {
-            free(raw);
-            free(kept);
-            session_free(&sess);
-            print_error("Unknown filter mode", EINVAL);
-            return 1;
+        switch (m) {
+            case M_CHANGED:   keep = (old_vs_new != 0); break;
+            case M_UNCHANGED: keep = (old_vs_new == 0); break;
+            case M_INCREASED: keep = (old_vs_new < 0);  break;
+            case M_DECREASED: keep = (old_vs_new > 0);  break;
+            case M_GT:        keep = (entry_as_double(&cur, type) > target); break;
+            case M_LT:        keep = (entry_as_double(&cur, type) < target); break;
+            case M_EQ:        keep = entry_equals_value(&cur, type, target) == 0; break;
+            case M_NE:        keep = entry_equals_value(&cur, type, target) != 0; break;
+            case M_RANGE: {
+                double d = entry_as_double(&cur, type);
+                keep = (d >= lo && d <= hi);
+                break;
+            }
         }
 
         if (keep) {
@@ -1125,6 +1232,7 @@ static int cmd_scan_filter(int pid, const char *type_name, const char *mode, con
 
     // Persist the narrowed session.
     uint8_t saved_elem = sess.elem_size ? sess.elem_size : elem_size;
+    uint32_t scanned = sess.count;          // capture BEFORE free (it zeroes count)
     session_free(&sess);
     struct scan_session out;
     out.pid = pid;
@@ -1133,10 +1241,8 @@ static int cmd_scan_filter(int pid, const char *type_name, const char *mode, con
     out.count = kept_n;
     out.entries = kept;
     session_save(pid, type_name, &out);
-    uint32_t scanned = sess.count;
     free(raw);
     free(kept);
-    session_free(&sess);
 
     printf("{\"status\":\"ok\",\"pid\":%d,\"type\":\"%s\",\"mode\":\"%s\",\"count\":%u,\"scanned\":%u,\"readable\":%u}\n",
            pid, type_name, mode, kept_n, scanned, ok_count);
@@ -1172,6 +1278,165 @@ static int cmd_scan_reset(int pid, const char *type_name) {
         return 1;
     }
     printf("{\"status\":\"ok\",\"pid\":%d,\"type\":\"%s\",\"reset\":true}\n", pid, type_name);
+    return 0;
+}
+
+// Read many addresses in one pass. Essential for inspecting a candidate list
+// without one CLI invocation (and one syscall) per address.
+// argv: read_values <pid> <type> <addr1> [addr2 ...]
+static int cmd_read_values(int pid, const char *type_name, int argc, char **argv) {
+    uint8_t elem_size = 4, align = 4;
+    uint8_t type = scan_type_from_name(type_name, &elem_size, &align);
+    if (type == 0) { print_error("Invalid type", EINVAL); return 1; }
+    if (argc <= 0) { print_error("No addresses given", EINVAL); return 1; }
+    if (argc > 65536) { print_error("Too many addresses (max 65536)", E2BIG); return 1; }
+
+    uint32_t n = (uint32_t)argc;
+    uint64_t *addrs = (uint64_t *)malloc(sizeof(uint64_t) * n);
+    uint8_t *raw = (uint8_t *)calloc(1, (size_t)n * elem_size);
+    uint8_t *live = (uint8_t *)calloc(1, n);
+    if (!addrs || !raw || !live) {
+        free(addrs); free(raw); free(live);
+        print_error("Out of memory", ENOMEM);
+        return 1;
+    }
+    for (uint32_t i = 0; i < n; i++) addrs[i] = strtoull(argv[i], NULL, 0);
+
+    uint32_t okn = 0;
+    read_many(pid, addrs, n, elem_size, raw, &okn, live);
+
+    printf("{\"status\":\"ok\",\"pid\":%d,\"type\":\"%s\",\"count\":%u,\"values\":[", pid, type_name, n);
+    for (uint32_t i = 0; i < n; i++) {
+        if (i) printf(",");
+        printf("{\"addr\":\"0x%llx\",", (unsigned long long)addrs[i]);
+        if (!live[i]) {
+            printf("\"readable\":false}");
+            continue;
+        }
+        struct scan_entry e;
+        e.addr = addrs[i];
+        decode_value(&e, type, raw + (size_t)i * elem_size);
+        printf("\"readable\":true,\"value\":");
+        if (scan_type_is_float(type)) {
+            printf("%.9g", e.val.f);
+        } else if (type == HMKPM_SCAN_TYPE_U64 || type == HMKPM_SCAN_TYPE_U32 ||
+                   type == HMKPM_SCAN_TYPE_U16 || type == HMKPM_SCAN_TYPE_U8) {
+            printf("%llu", (unsigned long long)e.val.u);
+        } else {
+            printf("%lld", (long long)e.val.i);
+        }
+        printf("}");
+    }
+    printf("],\"readable_count\":%u}\n", okn);
+
+    free(addrs); free(raw); free(live);
+    return 0;
+}
+
+// Search for a literal byte/string across the target's readable memory.
+// Far more useful for tracing config values, URLs and localization strings
+// than a numeric scan. argv: find_string <pid> <needle> [perms] [limit]
+static int cmd_find_string(int pid, const char *needle, const char *filter_perms, int limit) {
+    size_t needle_len = strlen(needle);
+    if (needle_len == 0) { print_error("Empty search string", EINVAL); return 1; }
+    if (limit <= 0) limit = 100;
+
+    uint32_t range_count = 0;
+    struct hmkpm_scan_range *ranges = collect_ranges_alloc(pid, filter_perms, &range_count);
+    if (!ranges) { print_error("Cannot read maps for search", EACCES); return 1; }
+
+    const size_t CHUNK = 1024 * 1024;
+    uint8_t *buf = (uint8_t *)malloc(CHUNK + sizeof(struct hmkpm_req));
+    if (!buf) { free(ranges); print_error("Out of memory", ENOMEM); return 1; }
+
+    int found = 0;
+    printf("{\"status\":\"ok\",\"pid\":%d,\"pattern\":\"", pid);
+    for (size_t i = 0; i < needle_len; i++) {
+        unsigned char c = (unsigned char)needle[i];
+        if (c == '"' || c == '\\') printf("\\%c", c);
+        else if (c >= 32 && c < 127) putchar(c);
+        else printf("\\u%04x", c);
+    }
+    printf("\",\"matches\":[");
+
+    for (uint32_t r = 0; r < range_count && found < limit; r++) {
+        uint64_t cur = ranges[r].start_va;
+        uint64_t end_va = ranges[r].start_va + ranges[r].size;
+        struct hmkpm_req *req = (struct hmkpm_req *)buf;
+        uint8_t *data = buf + sizeof(struct hmkpm_req);
+        while (cur < end_va && found < limit) {
+            size_t want = (size_t)(end_va - cur);
+            if (want > CHUNK) want = CHUNK;
+            req->pid = pid;
+            req->addr = cur;
+            req->size = want;
+            errno = 0;
+            long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_READ, buf,
+                               sizeof(struct hmkpm_req) + want);
+            if ((ret < 0 && ret != 0) && want > 4096) {
+                want = 4096;                       // page-by-page around a hole
+                req->size = want;
+                ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_READ, buf,
+                              sizeof(struct hmkpm_req) + want);
+            }
+            if (ret < 0 && ret != 0) { cur += want ? want : 4096; continue; }
+
+            if (want >= needle_len) {
+                for (size_t off = 0; off + needle_len <= want; off++) {
+                    if (data[off] != (uint8_t)needle[0]) continue;
+                    if (memcmp(data + off, needle, needle_len) != 0) continue;
+                    if (found) printf(",");
+                    printf("\"0x%llx\"", (unsigned long long)(cur + off));
+                    found++;
+                    if (found >= limit) break;
+                }
+            }
+            cur += want;
+        }
+    }
+    printf("],\"count\":%d}\n", found);
+
+    free(buf);
+    free(ranges);
+    return 0;
+}
+
+// Resolve the load base of a module (e.g. libil2cpp.so) and optionally add an
+// RVA, which is how every pointer chain in a game actually starts.
+// argv: module_base <pid> <module> [rva]
+static int cmd_module_base(int pid, const char *module, const char *rva_str) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) { print_error("Cannot read maps", errno); return 1; }
+
+    uint64_t base = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        uint64_t start = 0, end = 0, offset = 0;
+        char perms[8] = {0}, dev[16] = {0};
+        unsigned long inode = 0;
+        char pathname[256] = {0};
+        int c = sscanf(line, "%llx-%llx %7s %llx %15s %lu %255[^\n]",
+                       (unsigned long long *)&start, (unsigned long long *)&end,
+                       perms, (unsigned long long *)&offset, dev, &inode, pathname);
+        if (c < 7) continue;
+        char *name = pathname;
+        while (*name == ' ') name++;
+        const char *slash = strrchr(name, '/');
+        const char *leaf = slash ? slash + 1 : name;
+        if (strcmp(leaf, module) != 0) continue;
+        // The first mapping of a module with offset 0 is its load base.
+        if (offset == 0) { base = start; break; }
+        if (!base) base = start;               // fall back to the lowest VMA
+    }
+    fclose(f);
+
+    if (!base) { print_error("Module not mapped in this process", ENOENT); return 1; }
+    uint64_t rva = rva_str ? strtoull(rva_str, NULL, 0) : 0;
+    printf("{\"status\":\"ok\",\"pid\":%d,\"module\":\"%s\",\"base\":\"0x%llx\",\"rva\":\"0x%llx\",\"address\":\"0x%llx\"}\n",
+           pid, module, (unsigned long long)base, (unsigned long long)rva,
+           (unsigned long long)(base + rva));
     return 0;
 }
 
@@ -1308,6 +1573,20 @@ int main(int argc, char **argv) {
         return cmd_scan_results(atoi(argv[2]), argv[3]);
     } else if (strcmp(cmd, "scan_reset") == 0 && argc >= 4) {
         return cmd_scan_reset(atoi(argv[2]), argv[3]);
+    } else if (strcmp(cmd, "read_values") == 0 && argc >= 5) {
+        return cmd_read_values(atoi(argv[2]), argv[3], argc - 4, &argv[4]);
+    } else if (strcmp(cmd, "find_string") == 0 && argc >= 4) {
+        // find_string <pid> <needle> [perms] [limit]
+        int limit = 100;
+        const char *fp = "rw-p";
+        if (argc >= 5) {
+            if (isdigit(argv[4][0])) limit = atoi(argv[4]);
+            else { fp = argv[4]; if (argc >= 6) limit = atoi(argv[5]); }
+        }
+        return cmd_find_string(atoi(argv[2]), argv[3], fp, limit);
+    } else if (strcmp(cmd, "module_base") == 0 && argc >= 4) {
+        const char *rva = argc >= 5 ? argv[4] : NULL;
+        return cmd_module_base(atoi(argv[2]), argv[3], rva);
     }
 
     print_error("Unknown command or missing arguments", EINVAL);

@@ -313,5 +313,79 @@ export function buildServer(options) {
     },
   );
 
+  // 12. read_values -- batch read, avoids one process per address
+  server.registerTool(
+    "read_values",
+    {
+      title: "Read many typed values at once",
+      description:
+        "Read the same typed value from many addresses in a single call. Use this to inspect a candidate list from scan_results without paying a process spawn per address. Returns one entry per address with a `readable` flag, so stale/unmapped addresses stay distinguishable from real zeros.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        addresses: z
+          .array(z.union([z.string(), z.number()]))
+          .min(1)
+          .max(4096)
+          .describe("Addresses as hex strings or numbers (max 4096)."),
+        type: z.enum(TYPES).default("i32").describe("Data type (default i32)."),
+      },
+    },
+    async ({ pid, addresses, type }) => {
+      try {
+        return ok(await tools.readValues({ pid, addresses, type }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // 13. find_string -- literal byte search
+  server.registerTool(
+    "find_string",
+    {
+      title: "Search for a literal string in memory",
+      description:
+        "Search the target's readable memory for a literal byte sequence (UTF-8 text, a config key, a URL, part of a JSON payload). Complements the numeric scans: locate an identifier here, then use read_values or module_base to follow the data. Returns matching addresses.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        pattern: z.string().min(1).describe("Literal byte string to search for."),
+        perms: z.string().default("rw-p").describe("Memory permission filter. Default \"rw-p\"."),
+        limit: z.number().int().positive().max(5000).default(100).describe("Maximum results (default 100)."),
+      },
+    },
+    async ({ pid, pattern, perms, limit }) => {
+      try {
+        return ok(await tools.findString({ pid, pattern, perms, limit }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // 14. module_base -- load base + RVA resolution
+  server.registerTool(
+    "module_base",
+    {
+      title: "Resolve a module load base (optional plus RVA)",
+      description:
+        "Return the runtime load base of a shared object (e.g. libil2cpp.so, libc.so), optionally with an RVA added. Pointer chains in a native app start from a module base, so this is the entry point for address resolution.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        module: z.string().min(1).describe("Library file name, e.g. \"libil2cpp.so\"."),
+        rva: z
+          .union([z.string(), z.number()])
+          .optional()
+          .describe("Optional offset from the base (hex string or number)."),
+      },
+    },
+    async ({ pid, module, rva }) => {
+      try {
+        return ok(await tools.moduleBase({ pid, module, rva }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
   return server;
 }
