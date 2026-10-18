@@ -2,15 +2,33 @@ import { execFile } from "node:child_process";
 
 const DEFAULT_CLI = "/data/local/tmp/hmkpm_cli";
 
-function run(cmd, args, { timeout = 30000 } = {}) {
+function run(cmd, args, { timeout = 30000, stdin } = {}) {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, { timeout, maxBuffer: 32 * 1024 * 1024, windowsHide: true }, (err, stdout, stderr) => {
-      if (err) {
-        reject(new Error(`[${cmd}] ${err.message}${stderr ? `\n${stderr}` : ""}`));
-        return;
-      }
-      resolve(stdout);
-    });
+    const child = execFile(
+      cmd,
+      args,
+      { timeout, maxBuffer: 32 * 1024 * 1024, windowsHide: true },
+      (err, stdout, stderr) => {
+        if (err) {
+          // hmkpm_cli reports errors as JSON on stdout with a non-zero exit
+          // code (a failed Lua script, an unreadable address). That payload is
+          // the useful answer, so pass it through instead of discarding it.
+          const trimmed = (stdout || "").trim();
+          if (trimmed.endsWith("}") && trimmed.includes("\"status\"")) {
+            resolve(stdout);
+            return;
+          }
+          reject(new Error(`[${cmd}] ${err.message}${stderr ? `\n${stderr}` : ""}`));
+          return;
+        }
+        resolve(stdout);
+      },
+    );
+    if (stdin !== undefined) {
+      // A command that reads stdin blocks until it sees EOF, so end the stream
+      // after writing; otherwise the CLI waits forever for the rest.
+      child.stdin.end(String(stdin));
+    }
   });
 }
 
@@ -54,7 +72,8 @@ export class AdbDevice {
   }
 
   // Invoke the on-device CLI, returning the parsed JSON object.
-  async invoke(cliArgs) {
+  // `stdin` is passed through to the process when the command reads it.
+  async invoke(cliArgs, { stdin } = {}) {
     const remote = [this.cliPath, ...cliArgs]
       .map((a) => shellQuote(String(a)))
       .join(" ");
@@ -63,15 +82,16 @@ export class AdbDevice {
     if (this.isLocal) {
       // Running directly on Android device (e.g. Termux or native service)
       if (this.useSu) {
-        stdout = await run(this.suPath, ["-c", remote], { timeout: this.timeout });
+        stdout = await run(this.suPath, ["-c", remote], { timeout: this.timeout, stdin });
       } else {
-        stdout = await run(this.cliPath, cliArgs.map(String), { timeout: this.timeout });
+        stdout = await run(this.cliPath, cliArgs.map(String), { timeout: this.timeout, stdin });
       }
     } else {
       // Running on PC / remote host via ADB
       const inner = this.useSu ? `su -c ${shellQuote(remote)}` : remote;
       stdout = await run(this.adbPath, [...this.baseArgs(), "shell", inner], {
         timeout: this.timeout,
+        stdin,
       });
     }
     return parseCliJson(stdout);

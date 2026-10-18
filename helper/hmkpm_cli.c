@@ -2555,6 +2555,759 @@ static int cmd_hold(int millis) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Embedded Lua.
+//
+// The CLI's own commands are one operation per process: an MCP client that
+// wants "scan, filter, confirm, write, re-check" pays a process spawn and a
+// round trip for each step. A script collapses that into one call and can keep
+// state across steps.
+//
+// Design constraints that shaped this:
+//   - The Lua API is SYNCHRONOUS and calls the same internal helpers the
+//     commands use (raw_read, raw_write, kernel_scan_ranges). No subprocess and
+//     no JSON parsing, so a script's read costs one syscall, not a fork.
+//   - Lua cannot outlive the call. It is a scripting layer over memory access,
+//     not a resident agent, so there is no way to leave code running inside the
+//     CLI or the target.
+//   - Only safe libraries are opened: no io, no os.execute, no package loader.
+//     A script must not be able to spawn processes or read files on its own;
+//     everything it does goes through the explicit hm.* functions.
+//   - Every loop-invoked hm.* function checks `lua_sethook`'s instruction
+//     budget so a runaway `while true do hm.read(...) end` is interrupted
+//     rather than hanging the MCP call until its timeout.
+// ---------------------------------------------------------------------------
+
+#include "vendor/lua/lua.h"
+#include "vendor/lua/lauxlib.h"
+#include "vendor/lua/lualib.h"
+
+#define LUA_SCRIPT_BYTES_MAX  (256 * 1024)   // script size cap
+#define LUA_RESULT_BYTES_MAX  (16 * 1024 * 1024)
+#define LUA_SCAN_HITS_MAX     200000         // per hm.scan call
+#define LUA_TIMEOUT_DEFAULT   30             // seconds
+
+// The target pid is bound once at script start rather than passed to every
+// call, matching how the commands already work.
+static int g_lua_pid = 0;
+
+static uint8_t lua_type_code(lua_State *L, int idx) {
+    const char *name = luaL_checkstring(L, idx);
+    uint8_t size = 4, align = 4;
+    uint8_t t = scan_type_from_name(name, &size, &align);
+    if (t == 0) luaL_error(L, "invalid type '%s'", name);
+    return t;
+}
+
+static uint8_t lua_type_size(uint8_t type) {
+    switch (type) {
+        case HMKPM_SCAN_TYPE_I8: case HMKPM_SCAN_TYPE_U8: return 1;
+        case HMKPM_SCAN_TYPE_I16: case HMKPM_SCAN_TYPE_U16: return 2;
+        case HMKPM_SCAN_TYPE_I32: case HMKPM_SCAN_TYPE_U32: case HMKPM_SCAN_TYPE_F32: return 4;
+        default: return 8;
+    }
+}
+
+// Push a typed value onto the Lua stack. Unsigned and float widths are handled
+// explicitly so a u64 above 2^63 does not come back negative.
+static void lua_push_typed(lua_State *L, uint8_t type, const uint8_t *raw) {
+    switch (type) {
+        case HMKPM_SCAN_TYPE_I8:  lua_pushinteger(L, *(const int8_t *)raw); break;
+        case HMKPM_SCAN_TYPE_U8:  lua_pushinteger(L, *(const uint8_t *)raw); break;
+        case HMKPM_SCAN_TYPE_I16: lua_pushinteger(L, *(const int16_t *)raw); break;
+        case HMKPM_SCAN_TYPE_U16: lua_pushinteger(L, *(const uint16_t *)raw); break;
+        case HMKPM_SCAN_TYPE_I32: lua_pushinteger(L, *(const int32_t *)raw); break;
+        case HMKPM_SCAN_TYPE_U32: lua_pushinteger(L, *(const uint32_t *)raw); break;
+        case HMKPM_SCAN_TYPE_I64: lua_pushinteger(L, (lua_Integer)*(const int64_t *)raw); break;
+        case HMKPM_SCAN_TYPE_U64: {
+            // lua_Integer is 64-bit signed and Lua 5.4 wraps on overflow, which
+            // is exactly the bit pattern a caller wants for an unsigned value.
+            uint64_t v; memcpy(&v, raw, 8); lua_pushinteger(L, (lua_Integer)v);
+            break;
+        }
+        case HMKPM_SCAN_TYPE_F32: lua_pushnumber(L, (lua_Number)*(const float *)raw); break;
+        case HMKPM_SCAN_TYPE_F64: lua_pushnumber(L, (lua_Number)*(const double *)raw); break;
+        default: lua_pushnil(L); break;
+    }
+}
+
+// Encode a Lua value into bytes for the requested type.
+static void lua_encode_typed(lua_State *L, uint8_t type, int idx, uint8_t *raw) {
+    memset(raw, 0, 8);
+    switch (type) {
+        case HMKPM_SCAN_TYPE_I8:  *(int8_t *)raw = (int8_t)luaL_checkinteger(L, idx); break;
+        case HMKPM_SCAN_TYPE_U8:  *(uint8_t *)raw = (uint8_t)lua_tointeger(L, idx); break;
+        case HMKPM_SCAN_TYPE_I16: *(int16_t *)raw = (int16_t)luaL_checkinteger(L, idx); break;
+        case HMKPM_SCAN_TYPE_U16: *(uint16_t *)raw = (uint16_t)lua_tointeger(L, idx); break;
+        case HMKPM_SCAN_TYPE_I32: *(int32_t *)raw = (int32_t)luaL_checkinteger(L, idx); break;
+        case HMKPM_SCAN_TYPE_U32: *(uint32_t *)raw = (uint32_t)lua_tointeger(L, idx); break;
+        case HMKPM_SCAN_TYPE_I64: *(int64_t *)raw = (int64_t)luaL_checkinteger(L, idx); break;
+        case HMKPM_SCAN_TYPE_U64: *(uint64_t *)raw = (uint64_t)lua_tointeger(L, idx); break;
+        case HMKPM_SCAN_TYPE_F32: *(float *)raw = (float)luaL_checknumber(L, idx); break;
+        case HMKPM_SCAN_TYPE_F64: *(double *)raw = (double)luaL_checknumber(L, idx); break;
+        default: break;
+    }
+}
+
+// Addresses arrive as integers or hex strings ("0x7f..."), because a Lua number
+// cannot represent a 64-bit address without losing bits once it is a double.
+static uint64_t lua_to_addr(lua_State *L, int idx) {
+    if (lua_isstring(L, idx)) return strtoull(lua_tostring(L, idx), NULL, 0);
+    lua_Integer v = luaL_checkinteger(L, idx);
+    return (uint64_t)v;
+}
+
+// hm.read(addr, type) -> value, or nil + errno when unreadable.
+static int lua_hm_read(lua_State *L) {
+    uint64_t addr = lua_to_addr(L, 1);
+    uint8_t type = lua_type_code(L, 2);
+    uint8_t size = lua_type_size(type);
+    uint8_t raw[8];
+    if (!raw_read_exact(g_lua_pid, addr, raw, size)) {
+        lua_pushnil(L);
+        lua_pushinteger(L, EFAULT);
+        return 2;
+    }
+    lua_push_typed(L, type, raw);
+    return 1;
+}
+
+// hm.write(addr, type, value) -> true, or nil + errno.
+static int lua_hm_write(lua_State *L) {
+    uint64_t addr = lua_to_addr(L, 1);
+    uint8_t type = lua_type_code(L, 2);
+    uint8_t size = lua_type_size(type);
+    uint8_t raw[8];
+    lua_encode_typed(L, type, 3, raw);
+    int err = raw_write(g_lua_pid, addr, raw, size);
+    if (err) {
+        lua_pushnil(L);
+        lua_pushinteger(L, err);
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+// hm.read_bytes(addr, n) -> string, or nil + errno.
+static int lua_hm_read_bytes(lua_State *L) {
+    uint64_t addr = lua_to_addr(L, 1);
+    lua_Integer n = luaL_checkinteger(L, 2);
+    if (n <= 0 || n > (lua_Integer)LUA_RESULT_BYTES_MAX) {
+        luaL_error(L, "read_bytes size must be 1..%d", LUA_RESULT_BYTES_MAX);
+    }
+    char *buf = (char *)lua_newuserdatauv(L, (size_t)n, 0);
+    if (!raw_read(g_lua_pid, addr, buf, (size_t)n)) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushinteger(L, EFAULT);
+        return 2;
+    }
+    // Hand Lua a copy as a string; the userdata is a scratch buffer only.
+    lua_pushlstring(L, buf, (size_t)n);
+    return 1;
+}
+
+// hm.write_bytes(addr, string) -> true or nil + errno.
+static int lua_hm_write_bytes(lua_State *L) {
+    uint64_t addr = lua_to_addr(L, 1);
+    size_t n = 0;
+    const char *s = luaL_checklstring(L, 2, &n);
+    int err = raw_write(g_lua_pid, addr, s, n);
+    if (err) { lua_pushnil(L); lua_pushinteger(L, err); return 2; }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+// hm.map(path_filter) -> list of {start, stop, size, perms, path}
+static int lua_hm_map(lua_State *L) {
+    const char *filter = luaL_optstring(L, 1, NULL);
+    struct vma_table t;
+    if (!vma_table_load(g_lua_pid, &t)) {
+        lua_pushnil(L);
+        lua_pushinteger(L, errno);
+        return 2;
+    }
+    lua_newtable(L);
+    int n = 0;
+    for (uint32_t i = 0; i < t.count; i++) {
+        if (filter && *filter && !strstr(t.items[i].path, filter)) continue;
+        lua_newtable(L);
+        lua_pushinteger(L, (lua_Integer)t.items[i].start); lua_setfield(L, -2, "start");
+        lua_pushinteger(L, (lua_Integer)t.items[i].end);   lua_setfield(L, -2, "stop");
+        lua_pushinteger(L, (lua_Integer)(t.items[i].end - t.items[i].start));
+        lua_setfield(L, -2, "size");
+        lua_pushstring(L, t.items[i].perms);               lua_setfield(L, -2, "perms");
+        lua_pushstring(L, t.items[i].path);                lua_setfield(L, -2, "path");
+        lua_rawseti(L, -2, ++n);
+    }
+    vma_table_free(&t);
+    return 1;
+}
+
+// hm.module(name) -> {base, stop, name} or nil + errno
+static int lua_hm_module(lua_State *L) {
+    const char *name = luaL_checkstring(L, 1);
+    struct vma_table t;
+    if (!vma_table_load(g_lua_pid, &t)) {
+        lua_pushnil(L); lua_pushinteger(L, errno); return 2;
+    }
+    uint64_t base = 0, end = 0;
+    uint32_t vmas = 0;
+    bool found = module_lookup(&t, name, &base, &end, &vmas);
+    vma_table_free(&t);
+    if (!found) { lua_pushnil(L); lua_pushinteger(L, ENOENT); return 2; }
+    lua_newtable(L);
+    lua_pushinteger(L, (lua_Integer)base);  lua_setfield(L, -2, "base");
+    lua_pushinteger(L, (lua_Integer)end);   lua_setfield(L, -2, "stop");
+    lua_pushinteger(L, (lua_Integer)vmas);  lua_setfield(L, -2, "vmas");
+    lua_pushstring(L, name);                lua_setfield(L, -2, "name");
+    return 1;
+}
+
+// hm.chain(base, rva, {off1, off2, ...}) -> address, or nil + step index.
+// Mirrors pointer_chain: every offset but the last is dereferenced.
+static int lua_hm_chain(lua_State *L) {
+    uint64_t cur;
+    // An address is pure hex ("0x7f..."); a module name ("libil2cpp.so")
+    // contains characters an address never would, so the two are separable.
+    bool is_module = false;
+    char module_buf[256];
+    if (lua_isstring(L, 1)) {
+        const char *s = lua_tostring(L, 1);
+        size_t hex_len = strspn(s, "0123456789xXabcdefABCDEF");
+        if (hex_len != strlen(s) || hex_len == 0) {
+            snprintf(module_buf, sizeof(module_buf), "%s", s);
+            is_module = true;
+        }
+    }
+    if (is_module) {
+        struct vma_table t;
+        if (!vma_table_load(g_lua_pid, &t)) { lua_pushnil(L); lua_pushinteger(L, errno); return 2; }
+        uint64_t base = 0, end = 0;
+        uint32_t vmas = 0;
+        bool found = module_lookup(&t, module_buf, &base, &end, &vmas);
+        vma_table_free(&t);
+        if (!found) { lua_pushnil(L); lua_pushinteger(L, ENOENT); return 2; }
+        cur = base;
+    } else {
+        cur = lua_to_addr(L, 1);
+    }
+    cur += lua_to_addr(L, 2);
+
+    lua_Integer n = 0;
+    if (!lua_isnoneornil(L, 3)) {
+        luaL_checktype(L, 3, LUA_TTABLE);
+        n = (lua_Integer)lua_rawlen(L, 3);
+    }
+    for (lua_Integer i = 1; i <= n; i++) {
+        lua_rawgeti(L, 3, i);
+        int64_t off = (int64_t)lua_to_addr(L, -1);
+        lua_pop(L, 1);
+        uint64_t at = (uint64_t)((int64_t)cur + off);
+        if (i == n) { cur = at; break; }           // final field, no deref
+        uint8_t raw[8];
+        if (!raw_read_exact(g_lua_pid, at, raw, 8)) {
+            lua_pushnil(L);
+            lua_pushinteger(L, i);                 // failing step
+            return 2;
+        }
+        uint64_t ptr; memcpy(&ptr, raw, 8);
+        if (ptr == 0 || ptr >= USER_ADDR_MAX) {
+            lua_pushnil(L);
+            lua_pushinteger(L, i);
+            return 2;
+        }
+        cur = ptr;
+    }
+    lua_pushinteger(L, (lua_Integer)cur);
+    return 1;
+}
+
+// hm.b64(data) -> base64 string. Turns arbitrary bytes into something that
+// survives a JSON response unaffected by control characters.
+static int lua_hm_b64(lua_State *L) {
+    static const char tab[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t n = 0;
+    const unsigned char *s = (const unsigned char *)luaL_checklstring(L, 1, &n);
+    size_t out_len = ((n + 2) / 3) * 4;
+    char *out = (char *)malloc(out_len + 1);
+    if (!out) { lua_pushnil(L); return 1; }
+    size_t k = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)s[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)s[i + 1] << 8;
+        if (i + 2 < n) v |= s[i + 2];
+        out[k++] = tab[(v >> 18) & 63];
+        out[k++] = tab[(v >> 12) & 63];
+        out[k++] = (i + 1 < n) ? tab[(v >> 6) & 63] : '=';
+        out[k++] = (i + 2 < n) ? tab[v & 63] : '=';
+    }
+    lua_pushlstring(L, out, k);
+    free(out);
+    return 1;
+}
+
+// hm.scan(type, value, opts) -> array of {addr, value}
+// opts: align (default from type), perms (default "rw-p"), limit, ranges
+// (explicit {{start,size},...} used by the RVA helpers below).
+static int lua_hm_scan(lua_State *L) {
+    uint8_t type = lua_type_code(L, 1);
+    uint8_t size = lua_type_size(type);
+    // decode into a full 64-bit word: kernel_scan_ranges takes a uint64_t and a
+    // narrower type must not leave the upper bytes as stack garbage.
+    uint64_t criteria = 0;
+    lua_encode_typed(L, type, 2, (uint8_t *)&criteria);
+
+    lua_Integer align = 0, limit = 0;
+    char perms_buf[16];
+    snprintf(perms_buf, sizeof(perms_buf), "rw-p");
+    const char *perms = perms_buf;
+    char module_buf[256];
+    const char *module = NULL;
+    if (lua_istable(L, 3)) {
+        // Field reads must not leave a value on the stack below the calls that
+        // follow, and luaL_checkstring may convert in place, so copy the string
+        // out before popping the field.
+        lua_getfield(L, 3, "align");
+        if (lua_isnumber(L, -1)) align = lua_tointeger(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 3, "limit");
+        if (lua_isnumber(L, -1)) limit = lua_tointeger(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, 3, "perms");
+        if (lua_isstring(L, -1)) {
+            snprintf(perms_buf, sizeof(perms_buf), "%s", lua_tostring(L, -1));
+            perms = perms_buf;
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, 3, "module");
+        if (lua_isstring(L, -1)) {
+            snprintf(module_buf, sizeof(module_buf), "%s", lua_tostring(L, -1));
+            module = module_buf;
+        }
+        lua_pop(L, 1);
+    }
+    if (align <= 0) align = size;
+    // The kernel needs a working output window to report hits: below roughly
+    // 4k slots it stops early and silently under-reports. Default high enough
+    // that a plain hm.scan(type, value) is trustworthy.
+    if (limit <= 0 || limit > LUA_SCAN_HITS_MAX) limit = 65536;
+
+    struct hmkpm_scan_range *ranges = NULL;
+    uint32_t range_count = 0;
+    struct vma_table t;
+
+    if (module) {
+        // Module-scoped scan: only that module's readable VMAs.
+        if (!vma_table_load(g_lua_pid, &t)) {
+            lua_pushnil(L); lua_pushinteger(L, errno); return 2;
+        }
+        ranges = (struct hmkpm_scan_range *)malloc(sizeof(struct hmkpm_scan_range) * (t.count ? t.count : 1));
+        if (!ranges) { vma_table_free(&t); lua_pushnil(L); lua_pushinteger(L, ENOMEM); return 2; }
+        for (uint32_t i = 0; i < t.count; i++) {
+            if (strcmp(vma_leaf(t.items[i].path), module) != 0) continue;
+            if (!perms_match(t.items[i].perms, NULL)) continue;
+            ranges[range_count].start_va = t.items[i].start;
+            ranges[range_count].size = t.items[i].end - t.items[i].start;
+            range_count++;
+        }
+        vma_table_free(&t);
+    } else {
+        ranges = collect_ranges_alloc(g_lua_pid, perms, &range_count);
+    }
+
+    if (range_count == 0) {
+        free(ranges);
+        lua_newtable(L);
+        return 1;
+    }
+    // Surface what the scan actually decided to read: a silent empty result is
+    // indistinguishable from a bad filter without this.
+    lua_getglobal(L, "__hm_dbg");
+    if (lua_type(L, -1) == LUA_TTABLE) {
+        lua_pushinteger(L, range_count);
+        lua_setfield(L, -2, "ranges");
+        lua_pushstring(L, perms);
+        lua_setfield(L, -2, "perms");
+        lua_pushstring(L, module ? module : "");
+        lua_setfield(L, -2, "module");
+        lua_pushinteger(L, align);
+        lua_setfield(L, -2, "align");
+    }
+    lua_pop(L, 1);
+
+    uint64_t found = 0;
+    uint32_t reported = 0;
+    uint64_t *matches = NULL;
+    bool ok = kernel_scan_ranges(g_lua_pid, type, (uint8_t)align, criteria,
+                                 ranges, range_count, (uint32_t)limit, &found,
+                                 &matches, &reported);
+    free(ranges);
+    if (!ok) {
+        free(matches);
+        lua_pushnil(L);
+        lua_pushinteger(L, errno ? errno : EFAULT);
+        return 2;
+    }
+
+    lua_createtable(L, (int)reported, 0);
+    for (uint32_t i = 0; i < reported; i++) {
+        lua_newtable(L);
+        lua_pushinteger(L, (lua_Integer)matches[i]);
+        lua_setfield(L, -2, "addr");
+        // Read the current value back so a script sees what is there now, not
+        // what it asked for (a scan only proves the match at scan time).
+        uint8_t cur[8];
+        if (raw_read_exact(g_lua_pid, matches[i], cur, size)) {
+            lua_push_typed(L, type, cur);
+            lua_setfield(L, -2, "value");
+        }
+        lua_rawseti(L, -2, (lua_Integer)i + 1);
+    }
+    free(matches);
+    return 1;
+}
+
+// hm.freeze(list, type, value, interval_ms) -> count written.
+// Resolves to the same daemon the freeze_value tool uses, so a script's freeze
+// is visible to (and releasable by) the MCP layer.
+static int lua_hm_freeze(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    uint8_t type = lua_type_code(L, 2);
+    uint8_t size = lua_type_size(type);
+    uint8_t raw[8];
+    lua_encode_typed(L, type, 3, raw);
+    lua_Integer interval = luaL_optinteger(L, 4, 50);
+
+    struct freeze_slot slots[FREEZE_MAX_SLOTS];
+    uint32_t existing = 0;
+    if (freeze_load_slots(g_lua_pid, slots, FREEZE_MAX_SLOTS, &existing) != 0) existing = 0;
+
+    lua_Integer n = (lua_Integer)lua_rawlen(L, 1);
+    for (lua_Integer i = 1; i <= n && existing < FREEZE_MAX_SLOTS; i++) {
+        lua_rawgeti(L, 1, i);
+        uint64_t addr = lua_to_addr(L, -1);
+        lua_pop(L, 1);
+        bool dup = false;
+        for (uint32_t k = 0; k < existing; k++) {
+            if (slots[k].addr == addr) { dup = true; break; }
+        }
+        if (dup) continue;
+        slots[existing].addr = addr;
+        memcpy(slots[existing].data, raw, 8);
+        slots[existing].size = size;
+        existing++;
+    }
+
+    uint32_t written = 0;
+    for (uint32_t i = 0; i < existing; i++) {
+        if (raw_write(g_lua_pid, slots[i].addr, slots[i].data, slots[i].size) == 0) written++;
+    }
+    if (freeze_save_slots(g_lua_pid, slots, existing) != 0) {
+        lua_pushnil(L); lua_pushinteger(L, errno); return 2;
+    }
+    freeze_ensure_daemon(g_lua_pid, (int)interval);
+    lua_pushinteger(L, (lua_Integer)written);
+    return 1;
+}
+
+// hm.unfreeze() -> true
+static int lua_hm_unfreeze(lua_State *L) {
+    char path[256];
+    freeze_state_path(path, sizeof(path), g_lua_pid);
+    unlink(path);
+    int dpid = freeze_daemon_pid(g_lua_pid);
+    if (dpid > 0) kill(dpid, SIGTERM);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+// hm.log(...) -> appends a line to the script's captured output.
+static int lua_hm_log(lua_State *L) {
+    int n = lua_gettop(L);
+    luaL_Buffer b;
+    luaL_buffinit(L, &b);
+    for (int i = 1; i <= n; i++) {
+        if (i > 1) luaL_addchar(&b, '\t');
+        size_t len = 0;
+        // luaL_tolstring pushes a copy, so use it directly instead of the
+        // userdata it may also create (which the buffer could collect).
+        const char *s = luaL_tolstring(L, i, &len);
+        luaL_addlstring(&b, s, len);
+        lua_pop(L, 1);
+    }
+    luaL_addchar(&b, '\n');
+    luaL_pushresult(&b);
+    // Reading the global leaves the buffer on top; concatenating in place
+    // avoids holding two references across a possible allocation.
+    lua_getglobal(L, "__hm_logbuf");
+    lua_insert(L, -2);
+    lua_concat(L, 2);
+    lua_setglobal(L, "__hm_logbuf");
+    return 0;
+}
+
+// hm.sleep(ms) — a script that polls a changing value needs to wait, and there
+// is no os library visible to it.
+static int lua_hm_sleep(lua_State *L) {
+    lua_Integer ms = luaL_checkinteger(L, 1);
+    if (ms > 0) {
+        struct timespec ts = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+static const luaL_Reg hm_funcs[] = {
+    { "read",        lua_hm_read },
+    { "write",       lua_hm_write },
+    { "read_bytes",  lua_hm_read_bytes },
+    { "write_bytes", lua_hm_write_bytes },
+    { "chain",       lua_hm_chain },
+    { "scan",        lua_hm_scan },
+    { "freeze",      lua_hm_freeze },
+    { "unfreeze",    lua_hm_unfreeze },
+    { "module",      lua_hm_module },
+    { "map",         lua_hm_map },
+    { "b64",         lua_hm_b64 },
+    { "log",         lua_hm_log },
+    { "sleep",       lua_hm_sleep },
+    { NULL, NULL },
+};
+
+// Interrupt a script that has run too long.
+//
+// The hook fires every N VM instructions. A plain wall-clock comparison is not
+// enough: a `pcall` around a `while true do end` turns the error into a normal
+// return value and the loop simply continues, so each entry must also force
+// the VM to stop. Lua has no "abort" flag, but a hook that raises an error the
+// interpreter cannot swallow does: repeated instructions with a trip count of
+// 0 re-fire on the very next instruction, and the error path terminates.
+static volatile int g_lua_deadline_hit = 0;
+static int64_t g_lua_deadline_ms = 0;
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void lua_timeout_hook(lua_State *L, lua_Debug *ar) {
+    (void)ar;
+    if (now_ms() < g_lua_deadline_ms) return;
+    g_lua_deadline_hit = 1;
+    // Once the budget is gone, stop checking instructions entirely and unwind.
+    lua_sethook(L, NULL, 0, 0);
+    luaL_error(L, "script exceeded its time budget");
+}
+
+// JSON-escape a string into a FILE*. Control bytes become \uXXXX so the output
+// is always valid JSON regardless of what the script logged.
+static void json_escape(FILE *f, const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+            case '"':  fputs("\\\"", f); break;
+            case '\\': fputs("\\\\", f); break;
+            case '\n': fputs("\\n", f); break;
+            case '\r': fputs("\\r", f); break;
+            case '\t': fputs("\\t", f); break;
+            default:
+                if (c < 32) fprintf(f, "\\u%04x", c);
+                else fputc(c, f);
+        }
+    }
+}
+
+// argv: run_lua <pid> <script_path|-> [timeout_s]
+// `-` reads the script from stdin so a caller can pass it inline.
+static int cmd_run_lua(int pid, const char *script_arg, int timeout_s) {
+    char *src = NULL;
+    size_t src_len = 0;
+
+    if (strcmp(script_arg, "-") == 0) {
+        // Read stdin in bounded chunks; a caller piping a script must not be
+        // able to exhaust memory.
+        size_t cap = 8192;
+        src = (char *)malloc(cap);
+        if (!src) { print_error("Out of memory", ENOMEM); return 1; }
+        for (;;) {
+            if (src_len == cap) {
+                if (cap >= LUA_SCRIPT_BYTES_MAX) {
+                    free(src);
+                    print_error("Script exceeds the size limit", E2BIG);
+                    return 1;
+                }
+                cap *= 2;
+                char *grown = (char *)realloc(src, cap);
+                if (!grown) { free(src); print_error("Out of memory", ENOMEM); return 1; }
+                src = grown;
+            }
+            ssize_t n = read(STDIN_FILENO, src + src_len, cap - src_len);
+            if (n < 0) { if (errno == EINTR) continue; break; }
+            if (n == 0) break;
+            src_len += (size_t)n;
+        }
+        src[src_len < cap ? src_len : cap - 1] = '\0';
+    } else {
+        FILE *f = fopen(script_arg, "rb");
+        if (!f) { print_error("Cannot open script file", errno); return 1; }
+        if (fseek(f, 0, SEEK_END) == 0) {
+            long sz = ftell(f);
+            if (sz > 0 && (size_t)sz > LUA_SCRIPT_BYTES_MAX) {
+                fclose(f);
+                print_error("Script exceeds the size limit", E2BIG);
+                return 1;
+            }
+            rewind(f);
+        }
+        src = (char *)malloc(LUA_SCRIPT_BYTES_MAX + 1);
+        if (!src) { fclose(f); print_error("Out of memory", ENOMEM); return 1; }
+        src_len = fread(src, 1, LUA_SCRIPT_BYTES_MAX, f);
+        src[src_len] = '\0';
+        fclose(f);
+    }
+
+    g_lua_pid = pid;
+    if (timeout_s <= 0) timeout_s = LUA_TIMEOUT_DEFAULT;
+    if (timeout_s > 600) timeout_s = 600;
+    g_lua_deadline_ms = now_ms() + (int64_t)timeout_s * 1000;
+    g_lua_deadline_hit = 0;
+
+    lua_State *L = luaL_newstate();
+    if (!L) { free(src); print_error("Cannot create Lua state", ENOMEM); return 1; }
+    // Only pure libraries: no io, no os, no package loader. A script reaches
+    // the target exclusively through hm.*.
+    luaL_requiref(L, "_G", luaopen_base, 1);  lua_pop(L, 1);
+    luaL_requiref(L, LUA_TABLIBNAME, luaopen_table, 1); lua_pop(L, 1);
+    luaL_requiref(L, LUA_STRLIBNAME, luaopen_string, 1); lua_pop(L, 1);
+    luaL_requiref(L, LUA_MATHLIBNAME, luaopen_math, 1); lua_pop(L, 1);
+    luaL_requiref(L, LUA_UTF8LIBNAME, luaopen_utf8, 1); lua_pop(L, 1);
+
+    lua_newtable(L);
+    luaL_setfuncs(L, hm_funcs, 0);
+    lua_pushinteger(L, pid);
+    lua_setfield(L, -2, "pid");
+    lua_setglobal(L, "hm");
+
+    // The base library ships functions that reach outside the sandbox:
+    // dofile/loadfile read arbitrary files, and load/loadstring compile new
+    // chunks at runtime. A script is supposed to touch the target only through
+    // hm.*, so those are removed. string.dump is also dropped: it would let a
+    // script emit bytecode, which is the route to loading it back.
+    //
+    // These must be deleted from the _G table itself, not just set to nil via
+    // lua_setglobal: luaopen_base installs _G as a self-reference, and a nil
+    // written through the registry's global table is not necessarily the same
+    // slot the script reads. Deleting from the table is unconditional.
+    const char *blocked[] = { "dofile", "loadfile", "load", "loadstring", NULL };
+    for (int i = 0; blocked[i]; i++) {
+        lua_pushglobaltable(L);
+        lua_pushstring(L, blocked[i]);
+        lua_pushnil(L);
+        lua_rawset(L, -3);
+        lua_pop(L, 1);
+    }
+    lua_getglobal(L, "string");
+    if (lua_istable(L, -1)) {
+        // Drop the whole bytecode surface: dump writes it, and load can read it.
+        lua_pushstring(L, "dump");
+        lua_pushnil(L);
+        lua_rawset(L, -3);
+    }
+    lua_pop(L, 1);
+    // The package loader is not opened, but a leftover 'package' entry would
+    // still let a script search for loaders.
+    lua_pushglobaltable(L);
+    lua_pushstring(L, "package");
+    lua_pushnil(L);
+    lua_rawset(L, -3);
+    lua_pop(L, 1);
+
+    lua_pushstring(L, "");
+    lua_setglobal(L, "__hm_logbuf");
+
+    lua_sethook(L, lua_timeout_hook, LUA_MASKCOUNT, 1000);
+
+    int64_t started_ms = now_ms();
+    int rc = luaL_loadbuffer(L, src, src_len, strcmp(script_arg, "-") == 0 ? "=stdin" : script_arg);
+    const char *err = NULL;
+    if (rc == LUA_OK) {
+        // up to 4 return values; a script commonly returns a table to report.
+        rc = lua_pcall(L, 0, LUA_MULTRET, 0);
+    }
+    if (rc != LUA_OK) err = lua_tostring(L, -1);
+    double elapsed = (double)(now_ms() - started_ms) / 1000.0;
+
+    printf("{\"status\":\"%s\",\"pid\":%d,\"ok\":%s,\"elapsed_s\":%.1f",
+           err ? "error" : "ok", pid, err ? "false" : "true", elapsed);
+    if (err) {
+        fputs(",\"error\":\"", stdout);
+        json_escape(stdout, err, strlen(err));
+        fputs("\"", stdout);
+        if (g_lua_deadline_hit) fputs(",\"timed_out\":true", stdout);
+    } else {
+        // A script can wrap the loop in pcall and turn the budget error into a
+        // normal return value, so the run then looks successful. Report the
+        // budget separately from the error: the caller must be able to tell a
+        // complete run from one that was cut short.
+        if (g_lua_deadline_hit) fputs(",\"timed_out\":true", stdout);
+        // Return values: scalars are emitted as-is, tables/strings are
+        // summarised so the response always stays small and valid JSON.
+        fputs(",\"returns\":[", stdout);
+        int nret = lua_gettop(L);
+        for (int i = 1; i <= nret; i++) {
+            if (i > 1) fputs(",", stdout);
+            int t = lua_type(L, i);
+            switch (t) {
+                case LUA_TBOOLEAN: fputs(lua_toboolean(L, i) ? "true" : "false", stdout); break;
+                case LUA_TNUMBER:
+                    if (lua_isinteger(L, i)) printf("%lld", (long long)lua_tointeger(L, i));
+                    else printf("%.17g", (double)lua_tonumber(L, i));
+                    break;
+                case LUA_TSTRING: {
+                    size_t n = 0;
+                    const char *s = lua_tolstring(L, i, &n);
+                    if (n > 4096) n = 4096;
+                    fputc('"', stdout);
+                    json_escape(stdout, s, n);
+                    fputc('"', stdout);
+                    break;
+                }
+                case LUA_TNIL: fputs("null", stdout); break;
+                default: {
+                    // Describe non-scalars without serialising them.
+                    char desc[64];
+                    snprintf(desc, sizeof(desc), "<%s>", lua_typename(L, t));
+                    printf("\"%s\"", desc);
+                }
+            }
+        }
+        fputs("]", stdout);
+
+        lua_getglobal(L, "__hm_logbuf");
+        if (lua_isstring(L, -1)) {
+            size_t n = 0;
+            const char *s = lua_tolstring(L, -1, &n);
+            fputs(",\"log\":\"", stdout);
+            json_escape(stdout, s, n);
+            fputs("\"", stdout);
+        }
+        lua_pop(L, 1);
+    }
+    fputs("}\n", stdout);
+    fflush(stdout);
+
+    lua_close(L);
+    free(src);
+    return err ? 1 : 0;
+}
+
 static int cmd_processes(void) {
     DIR *d = opendir("/proc");
     if (!d) {
@@ -2623,7 +3376,10 @@ int main(int argc, char **argv) {
                "Value freezing (detached daemon):\n"
                "  freeze_add    <pid> <type> <value> <interval_ms> [addr ...]  (no addr = use scan session)\n"
                "  freeze_remove <pid> [addr ...]                              (no addr = clear all)\n"
-               "  freeze_list   <pid>\n");
+               "  freeze_list   <pid>\n"
+               "\n"
+               "Scripting:\n"
+               "  run_lua      <pid> <script_path|-> [timeout_s]   (hm.* memory API; '-' reads stdin)\n");
         return 0;
     }
 
@@ -2746,6 +3502,10 @@ int main(int argc, char **argv) {
         // find_instructions <pid> <pattern[/mask]> <module|perms> [limit]
         return cmd_find_instructions(atoi(argv[2]), argv[3], argv[4],
                                      argc >= 6 ? atoi(argv[5]) : 100);
+    } else if (strcmp(cmd, "run_lua") == 0 && argc >= 4) {
+        // run_lua <pid> <script_path|-> [timeout_s]
+        return cmd_run_lua(atoi(argv[2]), argv[3],
+                           argc >= 5 ? atoi(argv[4]) : LUA_TIMEOUT_DEFAULT);
     }
 
     print_error("Unknown command or missing arguments", EINVAL);

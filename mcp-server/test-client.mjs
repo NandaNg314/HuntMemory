@@ -73,7 +73,7 @@ const run = async () => {
     "scan_seed", "scan_unknown", "scan_filter", "scan_results", "scan_reset",
     "read_values", "find_string", "module_base",
     "pointer_chain", "freeze_value", "unfreeze_value", "list_freezes",
-    "dump_memory", "scan_rva", "find_instructions",
+    "dump_memory", "scan_rva", "find_instructions", "run_lua",
   ];
   for (const t of expected) {
     check(`tool registered: ${t}`, toolNames.includes(t));
@@ -395,6 +395,62 @@ const run = async () => {
       );
       check("daemon exits after unfreeze", flist2.running === "false" && flist2.count === 0);
     }
+  }
+
+  // --- Lua scripting ------------------------------------------------------
+  // A script replaces what would otherwise be several round trips. These checks
+  // use the throwaway target so nothing touches a live app.
+  console.log("\n=== 25. run_lua ===");
+  if (!writePid || !writeSlot) {
+    console.log("  SKIP: run_lua write checks need HMKPM_TEST_WRITE_PID");
+  } else {
+    const script = `
+      local hits = hm.scan("i32", 0x11111111, { perms = "rw-p" })
+      hm.log("scan hits", #hits)
+      assert(#hits > 0, "no stamped slot found")
+      local slot = hits[1].addr
+      local before = hm.read(slot, "i32")
+      assert(hm.write(slot, "i32", 4242), "write failed")
+      local after = hm.read(slot, "i32")
+      assert(after == 4242, "write did not land")
+      return #hits, before, after, string.format("0x%x", slot)
+    `;
+    const lua = await callTool("run_lua", { pid: writePid, script, timeoutS: 30 });
+    const luaText = lua.result?.content?.[0]?.text || "";
+    console.log("run_lua:", luaText.slice(0, 320));
+    const luaData = JSON.parse(luaText || "{}");
+    check("run_lua reports ok", luaData.ok === true);
+    check("run_lua returns multiple values", Array.isArray(luaData.returns) && luaData.returns.length === 4);
+    check("run_lua write landed", luaData.returns?.[2] === 4242);
+    check("run_lua captures log", typeof luaData.log === "string" && luaData.log.includes("scan hits"));
+
+    console.log("\n=== 26. run_lua error handling ===");
+    const bad = await callTool("run_lua", { pid: writePid, script: "this is not lua(" });
+    const badData = JSON.parse(bad.result?.content?.[0]?.text || "{}");
+    check("run_lua reports a syntax error", badData.ok === false && /syntax error/.test(badData.error || ""));
+
+    console.log("\n=== 27. run_lua sandbox ===");
+    const sandbox = await callTool("run_lua", {
+      pid: writePid,
+      script: "return type(io), type(os), type(require), type(dofile), type(loadfile), type(string.dump)",
+    });
+    const sb = JSON.parse(sandbox.result?.content?.[0]?.text || "{}");
+    check(
+      "run_lua blocks file and process escapes",
+      Array.isArray(sb.returns) && sb.returns.every((t) => t === "nil"),
+    );
+
+    console.log("\n=== 28. run_lua timeout ===");
+    const t0 = Date.now();
+    const slow = await callTool("run_lua", {
+      pid: writePid, script: "local ok = pcall(function() while true do end end)", timeoutS: 2,
+    });
+    const elapsed = (Date.now() - t0) / 1000;
+    const slowData = JSON.parse(slow.result?.content?.[0]?.text || "{}");
+    check("run_lua interrupts a runaway loop", elapsed < 10);
+    // A pcall around the loop turns the budget error into a return value, so the
+    // signal has to come from the dedicated flag rather than the error text.
+    check("run_lua reports the interrupted run", slowData.timed_out === true);
   }
 
   await finish();

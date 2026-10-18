@@ -579,5 +579,42 @@ export function buildServer(options) {
     },
   );
 
+  // 25. run_lua -- script multiple operations into one call
+  server.registerTool(
+    "run_lua",
+    {
+      title: "Run a Lua script against the target's memory",
+      description:
+        "Execute a Lua script that reads and writes the target's memory through a synchronous hm.* API, in one call instead of a round trip per operation. Use it for multi-step work: scan, then filter, then confirm, then write, then re-check. The script runs OUTSIDE the target process (it is not injected); it only reaches memory through hm.*. " +
+        "API: hm.pid; hm.read(addr,type) -> value|nil,errno; hm.write(addr,type,value) -> true|nil,errno; hm.read_bytes(addr,n) -> string|nil; hm.write_bytes(addr,str) -> true|nil; " +
+        "hm.chain(base_or_module, rva, {off1,off2,...}) -> addr|nil,failed_step (last offset not dereferenced); " +
+        "hm.scan(type,value,{align,perms,module,limit}) -> {{addr,value},...} (omit limit to get every hit; a small limit makes the kernel under-report); " +
+        "hm.freeze(addr_list,type,value,interval_ms) -> written_count; hm.unfreeze(); hm.module(name) -> {base,stop,vmas}; hm.map(path_filter) -> {{start,stop,size,perms,path}}; " +
+        "hm.b64(s); hm.log(...) (captured in the response); hm.sleep(ms). " +
+        "Libraries available: string, table, math, utf8. No io, os, require, dofile, load. Scripts are interrupted after timeoutS.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        script: z
+          .string()
+          .min(1)
+          .describe("Lua source. Return values are reported in `returns`; hm.log() output in `log`."),
+        timeoutS: z
+          .number()
+          .int()
+          .min(1)
+          .max(600)
+          .default(30)
+          .describe("Wall-clock budget in seconds before the script is interrupted."),
+      },
+    },
+    async ({ pid, script, timeoutS }) => {
+      try {
+        return ok(await tools.runLua({ pid, script, timeoutS }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
   return server;
 }

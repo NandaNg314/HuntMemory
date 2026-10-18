@@ -13,6 +13,10 @@ helper/hmkpm_cli_new
 helper/hmkpm_cli_werror
 *.elf
 
+# Vendored Lua: objects/build artifacts only, the sources are committed
+helper/vendor/lua/*.o
+helper/vendor/lua/*.a
+
 # Logs and temp files
 *.log
 *.tmp

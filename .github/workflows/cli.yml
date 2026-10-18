@@ -54,7 +54,14 @@ jobs:
           # -static matches helper/Makefile: the helper runs from
           # /data/local/tmp under su (magisk domain), which cannot dlopen
           # classified app/Termux libraries. A static ELF only needs the kernel.
-          "$CC" -O3 -Wall -Wextra -Werror -static helper/hmkpm_cli.c -o helper/hmkpm_cli
+          #
+          # Lua is vendored (helper/vendor/lua) and compiled in, so the result is
+          # still a single self-contained binary. loslib's tmpnam deprecation is
+          # upstream and unreachable: run_lua never opens the os library.
+          LUA_SRCS=$(find helper/vendor/lua -name '*.c' | sort)
+          "$CC" -O2 -Wall -Wextra -Wno-deprecated-declarations \
+            -Wno-unused-parameter -static -I helper/vendor/lua \
+            helper/hmkpm_cli.c $LUA_SRCS -lm -o helper/hmkpm_cli
           chmod 755 helper/hmkpm_cli
           file helper/hmkpm_cli
 
@@ -97,7 +104,6 @@ jobs:
             helper/Makefile
             hmkpm-mcp-server.zip
           retention-days: 30
-
       - name: Attach binary to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2

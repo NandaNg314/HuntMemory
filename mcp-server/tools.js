@@ -250,6 +250,18 @@ export class HmkpmTools {
       "find_instructions", String(pid), String(pattern), String(where), String(limit),
     ]);
   }
+
+  // Run a Lua script against the target. The source travels over stdin, so
+  // multi-line code needs no temp file and no quoting.
+  async runLua({ pid, script, timeoutS = 30 }) {
+    if (typeof script !== "string" || !script.trim()) {
+      throw new Error("script must be a non-empty Lua source string");
+    }
+    return this.device.invoke(
+      ["run_lua", String(pid), "-", String(timeoutS)],
+      { stdin: script },
+    );
+  }
 }
 
 // The CLI parses numbers with strtol/strtoul base 0 (so "0x.." works) and

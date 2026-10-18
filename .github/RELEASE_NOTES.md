@@ -1,3 +1,29 @@
+## 本版本新增了什么
+
+**Lua 脚本（`run_lua`，第 24 个工具）**
+
+一次调用就能完成「扫描 → 过滤 → 确认 → 写值 → 复查」多步操作，不再为每一步付一次往返。脚本**在目标进程之外**运行（不是注入），只通过 `hm.*` 访问内存：
+
+```lua
+local hits = hm.scan("i32", 100, { perms = "rw-p" })
+hm.sleep(500)
+local keep = {}
+for _, h in ipairs(hits) do
+  local v = hm.read(h.addr, "i32")
+  if v and v ~= 100 then keep[#keep + 1] = h.addr end
+end
+for _, a in ipairs(keep) do hm.write(a, "i32", 999) end
+return #hits, #keep
+```
+
+可用：`hm.read` / `hm.write` / `hm.read_bytes` / `hm.write_bytes` / `hm.chain`（多级指针链）/ `hm.scan` / `hm.freeze` / `hm.unfreeze` / `hm.module` / `hm.map` / `hm.b64` / `hm.log` / `hm.sleep`。
+
+Lua 5.4.7 已静态编译进 `hmkpm_cli`，平板上不需要另装解释器，产物仍是单个自包含二进制。
+
+**安全边界**：脚本只有 `string` / `table` / `math` / `utf8`，没有 `io` / `os` / `require` / `dofile` / `load` / `string.dump`，无法自行读写文件或启动进程。超过 `timeoutS`（默认 30 秒）会被强制中断，响应带 `timed_out: true`——用 `pcall` 包住死循环也一样。
+
+**注意 `limit`**：省略时返回全部命中。显式传很小的 `limit` 会让内核提前停止扫描而漏报（实测 `limit=2048` 只报 1050 条），要完整结果就不要设置它。
+
 ## 本版本修复了什么
 
 这个版本修掉了一条会让人误以为「工具坏了」的链路问题：

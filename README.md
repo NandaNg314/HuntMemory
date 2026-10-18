@@ -54,6 +54,45 @@ hmkpm-mcp/
 | `dump_memory` | **内存/模块导出到文件**：流式写盘，附带 `.txt` 映射表（文件偏移 ↔ 地址 ↔ 权限），可直接导入 IDA/Ghidra | `pid`, `target`, `size`, `outPath`, `perms` |
 | `scan_rva` | **模块内搜索，输出 RVA**：结果以模块偏移表示，跨重启有效 | `pid`, `module`, `value`, `type`, `align` |
 | `find_instructions` | **ARM64 指令搜索**：支持掩码通配，例如 `B9000000/FFF00000` 匹配任意寄存器的 32 位 STR；结果带模块名与 RVA | `pid`, `pattern`, `where`, `limit` |
+| `run_lua` | **Lua 脚本批量操作**：一次调用内完成「扫描 → 过滤 → 确认 → 写值 → 复查」多步操作，省掉每步一个来回 | `pid`, `script`, `timeoutS` |
+
+### Lua 脚本（`run_lua`）
+
+脚本**在目标进程之外**运行（不是注入），只通过 `hm.*` 访问目标内存。适合把固定流程固化成一次调用：
+
+```lua
+-- 找到血量字段：扫描 -> 只保留变化过的 -> 改成 999
+local hits = hm.scan("i32", 100, { perms = "rw-p" })
+hm.log("初筛命中", #hits)
+hm.sleep(500)
+local keep = {}
+for _, h in ipairs(hits) do
+  local v = hm.read(h.addr, "i32")
+  if v and v ~= 100 then keep[#keep + 1] = h.addr end
+end
+hm.log("收敛后", #keep)
+for _, a in ipairs(keep) do hm.write(a, "i32", 999) end
+return #hits, #keep
+```
+
+可用 API：
+
+| 函数 | 说明 |
+| --- | --- |
+| `hm.pid` | 当前目标 pid |
+| `hm.read(addr, type)` | 读值，失败返回 `nil, errno` |
+| `hm.write(addr, type, value)` | 写值，成功返回 `true` |
+| `hm.read_bytes(addr, n)` / `hm.write_bytes(addr, str)` | 原始字节读写 |
+| `hm.chain(base_or_module, rva, {off1, off2, ...})` | 多级指针链，末段偏移不解析；失败返回 `nil, 第几步` |
+| `hm.scan(type, value, {align, perms, module, limit})` | 搜索，返回 `{{addr=..., value=...}, ...}` |
+| `hm.freeze(addr_list, type, value, interval_ms)` / `hm.unfreeze()` | 冻结/解除，与 `freeze_value` 共用同一个守护进程 |
+| `hm.module(name)` | `{base, stop, vmas}` |
+| `hm.map(path_filter)` | VMA 列表 |
+| `hm.b64(data)` / `hm.log(...)` / `hm.sleep(ms)` | 编码、日志（进 `log` 字段）、等待 |
+
+约束：可用标准库仅 `string` / `table` / `math` / `utf8`；**没有** `io` / `os` / `require` / `dofile` / `load` / `string.dump`，脚本无法自行读写文件或启动进程。脚本超过 `timeoutS`（默认 30 秒）会被中断，响应里带 `timed_out: true`——即使脚本用 `pcall` 包住了死循环也一样。
+
+关于 `limit`：省略时返回全部命中。**显式传一个很小的 limit 会让内核提前停止扫描而漏报**（实测 limit=2048 只报 1050 条），需要全部结果时不要设置它。
 
 ### 典型工作流
 
@@ -75,6 +114,12 @@ pointer_chain libil2cpp.so 0x1A2B3C0 [0x18, 0x20, 0x8]
 dump_memory  libil2cpp.so -> /sdcard/lib.so
 find_instructions B9000000/FFF00000
                                          -> 找到写该字段的指令，定位更新函数
+```
+
+把上面几步固化成脚本，以后一次调用完成：
+
+```
+run_lua  <pid>  <脚本：module 取基址 -> chain 解析 -> read 确认 -> write 改值>
 ```
 
 **关于冻结**：`freeze_value` 会启动一个独立守护进程（同一二进制 `_freeze_daemon`），在设备上持续回写。实测每 50ms 回写一次时 CPU 占用约 0.4% 单核。目标进程退出或执行 `unfreeze_value` 后守护进程自动结束，不会残留。
