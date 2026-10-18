@@ -44,7 +44,10 @@ jobs:
         run: |
           TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
           CC="$TC/bin/aarch64-linux-android31-clang"
-          "$CC" -O3 -Wall -Wextra -Werror helper/hmkpm_cli.c -o helper/hmkpm_cli
+          # -static matches helper/Makefile: the helper runs from
+          # /data/local/tmp under su (magisk domain), which cannot dlopen
+          # classified app/Termux libraries. A static ELF only needs the kernel.
+          "$CC" -O3 -Wall -Wextra -Werror -static helper/hmkpm_cli.c -o helper/hmkpm_cli
           chmod 755 helper/hmkpm_cli
           file helper/hmkpm_cli
 
@@ -53,6 +56,15 @@ jobs:
           TRIPLE=$(readelf -h helper/hmkpm_cli | awk '/Machine:/{print $2, $3, $4, $5}')
           echo "Machine: $TRIPLE"
           readelf -h helper/hmkpm_cli | grep -q "AArch64" || { echo "NOT an AArch64 binary"; exit 1; }
+
+      - name: Verify the binary is statically linked
+        run: |
+          if readelf -d helper/hmkpm_cli 2>/dev/null | grep -q NEEDED; then
+            echo "Binary has dynamic dependencies - it will fail to start under su:"
+            readelf -d helper/hmkpm_cli | grep NEEDED
+            exit 1
+          fi
+          echo "OK: no DT_NEEDED entries (fully static)"
 
       - name: Upload hmkpm_cli artifact
         uses: actions/upload-artifact@v4
@@ -68,7 +80,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: helper/hmkpm_cli
+          files: |
+            helper/hmkpm_cli
+            start_tablet.sh
+            service_boot.sh
 
   check-mcp:
     name: Check MCP server (Node)
