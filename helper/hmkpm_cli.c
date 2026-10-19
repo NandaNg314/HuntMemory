@@ -1855,6 +1855,1038 @@ static int cmd_pointer_chain(int pid, const char *base_arg, const char *rva_str,
 }
 
 // ---------------------------------------------------------------------------
+// Reverse pointer scan & automatic pointer chain discovery.
+// ---------------------------------------------------------------------------
+
+struct ptr_match {
+    uint64_t addr;
+    uint64_t ptr_val;
+    uint32_t offset;
+    bool is_static;
+    char module[64];
+    uint64_t module_base;
+    uint64_t rva;
+};
+
+// Check if an address falls within any file-backed module mapping.
+// If so, returns true and extracts module leaf name, module base, and RVA.
+static bool find_address_module(struct vma_table *t, uint64_t addr,
+                                char *module_out, size_t mod_sz,
+                                uint64_t *base_out, uint64_t *rva_out,
+                                char *path_out, size_t path_sz) {
+    if (!t) return false;
+    for (uint32_t i = 0; i < t->count; i++) {
+        if (addr >= t->items[i].start && addr < t->items[i].end) {
+            const char *path = t->items[i].path;
+            if (!path[0] || path[0] == '[') return false; // anonymous/heap/stack
+            if (path_out && path_sz > 0) {
+                snprintf(path_out, path_sz, "%s", path);
+            }
+            const char *leaf = vma_leaf(path);
+            if (module_out && mod_sz > 0) {
+                snprintf(module_out, mod_sz, "%s", leaf);
+            }
+            uint64_t base = 0, span_end = 0;
+            uint32_t vmas = 0;
+            if (module_lookup(t, leaf, &base, &span_end, &vmas)) {
+                if (base_out) *base_out = base;
+                if (rva_out) *rva_out = addr - base;
+            } else {
+                if (base_out) *base_out = t->items[i].start;
+                if (rva_out) *rva_out = addr - t->items[i].start;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static int cmp_ptr_match(const void *a, const void *b) {
+    const struct ptr_match *pa = (const struct ptr_match *)a;
+    const struct ptr_match *pb = (const struct ptr_match *)b;
+    if (pa->is_static != pb->is_static) {
+        return pa->is_static ? -1 : 1;
+    }
+    if (pa->offset != pb->offset) {
+        return (pa->offset < pb->offset) ? -1 : 1;
+    }
+    if (pa->addr != pb->addr) {
+        return (pa->addr < pb->addr) ? -1 : 1;
+    }
+    return 0;
+}
+
+static uint32_t scan_pointers_internal(int pid, struct vma_table *t,
+                                       uint64_t target_addr, uint32_t max_offset,
+                                       uint8_t align, const char *filter_perms,
+                                       struct ptr_match *out, uint32_t max_matches) {
+    if (!out || max_matches == 0) return 0;
+    if (align == 0) align = 8;
+    uint32_t count = 0;
+
+    // Fast path: if max_offset == 0 and align == 8, try kernel NEON SIMD exact scan
+    if (max_offset == 0 && align == 8) {
+        uint32_t range_count = 0;
+        struct hmkpm_scan_range *ranges = collect_ranges_alloc(pid, filter_perms, &range_count);
+        if (ranges && range_count > 0) {
+            uint64_t found = 0;
+            uint32_t reported = 0;
+            uint64_t *kmatches = NULL;
+            if (kernel_scan_ranges(pid, HMKPM_SCAN_TYPE_U64, 8, target_addr,
+                                   ranges, range_count, max_matches,
+                                   &found, &kmatches, &reported)) {
+                for (uint32_t i = 0; i < reported && count < max_matches; i++) {
+                    out[count].addr = kmatches[i];
+                    out[count].ptr_val = target_addr;
+                    out[count].offset = 0;
+                    out[count].is_static = find_address_module(t, kmatches[i],
+                                                              out[count].module, sizeof(out[count].module),
+                                                              &out[count].module_base, &out[count].rva, NULL, 0);
+                    count++;
+                }
+                free(kmatches);
+                free(ranges);
+                qsort(out, count, sizeof(struct ptr_match), cmp_ptr_match);
+                return count;
+            }
+            free(ranges);
+        }
+    }
+
+    // Range search / chunked read fallback
+    uint32_t range_count = 0;
+    struct hmkpm_scan_range *ranges = collect_ranges_alloc(pid, filter_perms, &range_count);
+    if (!ranges || range_count == 0) {
+        free(ranges);
+        return 0;
+    }
+
+    const size_t CHUNK = 2 * 1024 * 1024;
+    uint8_t *chunk = (uint8_t *)malloc(CHUNK + sizeof(struct hmkpm_req));
+    if (!chunk) {
+        free(ranges);
+        return 0;
+    }
+
+    uint64_t min_val = (target_addr >= max_offset) ? (target_addr - max_offset) : 0;
+    uint64_t max_val = target_addr;
+
+    for (uint32_t r = 0; r < range_count && count < max_matches; r++) {
+        uint64_t cur = ranges[r].start_va;
+        uint64_t end_va = ranges[r].start_va + ranges[r].size;
+        while (cur < end_va && count < max_matches) {
+            size_t want = (size_t)(end_va - cur);
+            if (want > CHUNK) want = CHUNK;
+            struct hmkpm_req *req = (struct hmkpm_req *)chunk;
+            req->pid = pid;
+            req->size = want;
+            size_t got = 0;
+            while (got < want && count < max_matches) {
+                req->addr = cur + got;
+                req->size = want - got;
+                errno = 0;
+                long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_READ, chunk, sizeof(struct hmkpm_req) + req->size);
+                size_t span;
+                if (ret >= 0 || ret == 0) {
+                    span = req->size;
+                } else if (req->size > 4096) {
+                    span = 4096;
+                } else {
+                    span = 4096;
+                    got += span;
+                    continue;
+                }
+                const uint8_t *data = chunk + sizeof(struct hmkpm_req);
+                for (size_t off = 0; off + 8 <= span && count < max_matches; off += align) {
+                    uint64_t val = *(const uint64_t *)(data + off);
+                    if (val >= min_val && val <= max_val) {
+                        uint64_t paddr = cur + got + off;
+                        out[count].addr = paddr;
+                        out[count].ptr_val = val;
+                        out[count].offset = (uint32_t)(target_addr - val);
+                        out[count].is_static = find_address_module(t, paddr,
+                                                                  out[count].module, sizeof(out[count].module),
+                                                                  &out[count].module_base, &out[count].rva, NULL, 0);
+                        count++;
+                    }
+                }
+                got += span;
+            }
+            cur += want;
+        }
+    }
+
+    free(chunk);
+    free(ranges);
+    qsort(out, count, sizeof(struct ptr_match), cmp_ptr_match);
+    return count;
+}
+
+static int cmd_ptr_scan(int pid, uint64_t target_addr, uint32_t max_offset,
+                        uint32_t max_matches, int custom_align, const char *filter_perms) {
+    if (custom_align <= 0) custom_align = 8;
+    if (max_matches == 0) max_matches = 256;
+    if (!filter_perms || !filter_perms[0]) filter_perms = "rw-p";
+
+    struct vma_table t;
+    if (!vma_table_load(pid, &t)) {
+        print_error("Cannot read maps", errno);
+        return 1;
+    }
+
+    struct ptr_match *matches = (struct ptr_match *)calloc(max_matches, sizeof(struct ptr_match));
+    if (!matches) {
+        vma_table_free(&t);
+        print_error("Out of memory", ENOMEM);
+        return 1;
+    }
+
+    uint32_t count = scan_pointers_internal(pid, &t, target_addr, max_offset,
+                                           (uint8_t)custom_align, filter_perms,
+                                           matches, max_matches);
+    vma_table_free(&t);
+
+    printf("{\"status\":\"ok\",\"pid\":%d,\"target_addr\":\"0x%llx\",\"max_offset\":%u,"
+           "\"align\":%d,\"count\":%u,\"matches\":[",
+           pid, (unsigned long long)target_addr, max_offset, custom_align, count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        printf("%s{\"addr\":\"0x%llx\",\"ptr_val\":\"0x%llx\",\"offset\":%u,\"offset_hex\":\"0x%x\","
+               "\"is_static\":%s",
+               i ? "," : "",
+               (unsigned long long)matches[i].addr,
+               (unsigned long long)matches[i].ptr_val,
+               matches[i].offset,
+               matches[i].offset,
+               matches[i].is_static ? "true" : "false");
+        if (matches[i].is_static) {
+            printf(",\"module\":\"%s\",\"base\":\"0x%llx\",\"rva\":\"0x%llx\"",
+                   matches[i].module,
+                   (unsigned long long)matches[i].module_base,
+                   (unsigned long long)matches[i].rva);
+        }
+        printf("}");
+    }
+    printf("]}\n");
+    free(matches);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Automatic pointer chain resolution (BFS backwards to static modules)
+// ---------------------------------------------------------------------------
+
+struct auto_chain_result {
+    char module[64];
+    uint64_t module_base;
+    uint64_t rva;
+    uint64_t entry_addr; // module_base + rva
+    uint8_t depth;       // number of dereferences
+    uint32_t offsets[8]; // forward offsets: offsets[0]=0, offsets[1..depth]
+    uint32_t total_offset;
+    bool verified;
+};
+
+struct bfs_node {
+    uint64_t addr;
+    uint64_t ptr_val;
+    uint32_t offset;
+    int32_t parent_idx;
+    uint8_t depth;
+};
+
+struct cand_item {
+    uint64_t target_addr;
+    int32_t node_idx;
+};
+
+static int cmp_chain_result(const void *a, const void *b) {
+    const struct auto_chain_result *ca = (const struct auto_chain_result *)a;
+    const struct auto_chain_result *cb = (const struct auto_chain_result *)b;
+    if (ca->depth != cb->depth) {
+        return (ca->depth < cb->depth) ? -1 : 1;
+    }
+    if (ca->total_offset != cb->total_offset) {
+        return (ca->total_offset < cb->total_offset) ? -1 : 1;
+    }
+    return 0;
+}
+
+static bool validate_chain_forward(int pid, uint64_t base, uint64_t rva,
+                                   const uint32_t *offsets, uint8_t depth,
+                                   uint64_t expected_target) {
+    uint64_t cur = base + rva;
+    int off_count = (int)depth + 1;
+    for (int i = 0; i < off_count; i++) {
+        uint64_t at = cur + offsets[i];
+        if (i == off_count - 1) {
+            return at == expected_target;
+        }
+        uint64_t ptr = 0;
+        if (!read_pointer(pid, at, &ptr)) return false;
+        cur = ptr;
+    }
+    return false;
+}
+
+static bool bfs_visited(uint64_t addr, const uint64_t *visited, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (visited[i] == addr) return true;
+    }
+    return false;
+}
+
+#define BFS_MAX_NODES 2048
+#define BFS_MAX_VISITED 4096
+
+static uint32_t run_ptr_chain_auto(int pid, uint64_t target_addr, int max_depth,
+                                   uint32_t max_offset, uint32_t max_results,
+                                   const char *filter_module, const char *filter_perms,
+                                   struct auto_chain_result *out) {
+    if (!out || max_results == 0) return 0;
+    if (max_depth < 1) max_depth = 1;
+    if (max_depth > 6) max_depth = 6;
+    if (max_offset == 0) max_offset = 0x400;
+    if (!filter_perms || !filter_perms[0]) filter_perms = "rw-p";
+
+    struct vma_table t;
+    if (!vma_table_load(pid, &t)) return 0;
+
+    // Check if target_addr itself is already in a static module
+    char direct_mod[64] = {0};
+    uint64_t direct_base = 0, direct_rva = 0;
+    if (find_address_module(&t, target_addr, direct_mod, sizeof(direct_mod),
+                            &direct_base, &direct_rva, NULL, 0)) {
+        if (!filter_module || !filter_module[0] || strcmp(direct_mod, filter_module) == 0) {
+            snprintf(out[0].module, sizeof(out[0].module), "%s", direct_mod);
+            out[0].module_base = direct_base;
+            out[0].rva = direct_rva;
+            out[0].entry_addr = target_addr;
+            out[0].depth = 0;
+            out[0].offsets[0] = 0;
+            out[0].total_offset = 0;
+            out[0].verified = true;
+            vma_table_free(&t);
+            return 1;
+        }
+    }
+
+    struct bfs_node *nodes = (struct bfs_node *)calloc(BFS_MAX_NODES, sizeof(struct bfs_node));
+    uint64_t *visited = (uint64_t *)malloc(sizeof(uint64_t) * BFS_MAX_VISITED);
+    if (!nodes || !visited) {
+        free(nodes);
+        free(visited);
+        vma_table_free(&t);
+        return 0;
+    }
+
+    uint32_t node_count = 0;
+    uint32_t visited_count = 0;
+    uint32_t chain_count = 0;
+    visited[visited_count++] = target_addr;
+
+    // Level 1: Find pointers pointing directly into [target_addr - max_offset, target_addr]
+    struct ptr_match *matches = (struct ptr_match *)calloc(256, sizeof(struct ptr_match));
+    if (!matches) {
+        free(nodes);
+        free(visited);
+        vma_table_free(&t);
+        return 0;
+    }
+    uint32_t m_count = scan_pointers_internal(pid, &t, target_addr, max_offset, 8, filter_perms, matches, 256);
+
+    for (uint32_t i = 0; i < m_count && chain_count < max_results; i++) {
+        if (bfs_visited(matches[i].addr, visited, visited_count)) continue;
+        if (visited_count < BFS_MAX_VISITED) visited[visited_count++] = matches[i].addr;
+
+        if (matches[i].is_static) {
+            if (!filter_module || !filter_module[0] || strcmp(matches[i].module, filter_module) == 0) {
+                uint32_t offsets[2] = { 0, matches[i].offset };
+                if (validate_chain_forward(pid, matches[i].module_base, matches[i].rva, offsets, 1, target_addr)) {
+                    snprintf(out[chain_count].module, sizeof(out[chain_count].module), "%s", matches[i].module);
+                    out[chain_count].module_base = matches[i].module_base;
+                    out[chain_count].rva = matches[i].rva;
+                    out[chain_count].entry_addr = matches[i].addr;
+                    out[chain_count].depth = 1;
+                    out[chain_count].offsets[0] = 0;
+                    out[chain_count].offsets[1] = matches[i].offset;
+                    out[chain_count].total_offset = matches[i].offset;
+                    out[chain_count].verified = true;
+                    chain_count++;
+                }
+            }
+        } else if (max_depth >= 2) {
+            if (node_count < BFS_MAX_NODES) {
+                nodes[node_count].addr = matches[i].addr;
+                nodes[node_count].ptr_val = matches[i].ptr_val;
+                nodes[node_count].offset = matches[i].offset;
+                nodes[node_count].parent_idx = -1;
+                nodes[node_count].depth = 1;
+                node_count++;
+            }
+        }
+    }
+    free(matches);
+
+    // Subsequent levels: BFS from cur_depth = 2 up to max_depth
+    uint32_t range_count = 0;
+    struct hmkpm_scan_range *ranges = collect_ranges_alloc(pid, filter_perms, &range_count);
+    const size_t CHUNK = 2 * 1024 * 1024;
+    uint8_t *chunk = (ranges && range_count > 0) ? (uint8_t *)malloc(CHUNK + sizeof(struct hmkpm_req)) : NULL;
+
+    for (int cur_depth = 2; cur_depth <= max_depth && chain_count < max_results && chunk; cur_depth++) {
+        // Collect candidate nodes from previous level (depth == cur_depth - 1)
+        struct cand_item cand_items[48];
+        int num_cands = 0;
+        for (uint32_t j = 0; j < node_count && num_cands < 48; j++) {
+            if (nodes[j].depth == cur_depth - 1) {
+                cand_items[num_cands].target_addr = nodes[j].addr;
+                cand_items[num_cands].node_idx = (int32_t)j;
+                num_cands++;
+            }
+        }
+        if (num_cands == 0) break;
+
+        uint64_t min_target = cand_items[0].target_addr;
+        uint64_t max_target = cand_items[0].target_addr;
+        for (int c = 1; c < num_cands; c++) {
+            if (cand_items[c].target_addr < min_target) min_target = cand_items[c].target_addr;
+            if (cand_items[c].target_addr > max_target) max_target = cand_items[c].target_addr;
+        }
+        uint64_t min_bound = (min_target >= max_offset) ? (min_target - max_offset) : 0;
+        uint64_t max_bound = max_target;
+
+        for (uint32_t r = 0; r < range_count && chain_count < max_results; r++) {
+            uint64_t cur = ranges[r].start_va;
+            uint64_t end_va = ranges[r].start_va + ranges[r].size;
+            while (cur < end_va && chain_count < max_results) {
+                size_t want = (size_t)(end_va - cur);
+                if (want > CHUNK) want = CHUNK;
+                struct hmkpm_req *req = (struct hmkpm_req *)chunk;
+                req->pid = pid;
+                req->size = want;
+                size_t got = 0;
+                while (got < want && chain_count < max_results) {
+                    req->addr = cur + got;
+                    req->size = want - got;
+                    errno = 0;
+                    long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_READ, chunk, sizeof(struct hmkpm_req) + req->size);
+                    size_t span;
+                    if (ret >= 0 || ret == 0) {
+                        span = req->size;
+                    } else if (req->size > 4096) {
+                        span = 4096;
+                    } else {
+                        span = 4096;
+                        got += span;
+                        continue;
+                    }
+                    const uint8_t *data = chunk + sizeof(struct hmkpm_req);
+                    for (size_t off = 0; off + 8 <= span && chain_count < max_results; off += 8) {
+                        uint64_t val = *(const uint64_t *)(data + off);
+                        if (val < min_bound || val > max_bound) continue;
+                        for (int c = 0; c < num_cands && chain_count < max_results; c++) {
+                            uint64_t caddr = cand_items[c].target_addr;
+                            if (val >= caddr - max_offset && val <= caddr) {
+                                uint64_t paddr = cur + got + off;
+                                if (bfs_visited(paddr, visited, visited_count)) continue;
+                                if (visited_count < BFS_MAX_VISITED) visited[visited_count++] = paddr;
+
+                                char mod[64] = {0};
+                                uint64_t mbase = 0, mrva = 0;
+                                bool is_static = find_address_module(&t, paddr, mod, sizeof(mod), &mbase, &mrva, NULL, 0);
+                                if (is_static) {
+                                    if (!filter_module || !filter_module[0] || strcmp(mod, filter_module) == 0) {
+                                        uint32_t offsets[8] = {0};
+                                        offsets[0] = 0;
+                                        offsets[1] = (uint32_t)(caddr - val);
+                                        int curr_node = cand_items[c].node_idx;
+                                        int path[8];
+                                        int path_len = 0;
+                                        while (curr_node != -1 && path_len < 6) {
+                                            path[path_len++] = curr_node;
+                                            curr_node = nodes[curr_node].parent_idx;
+                                        }
+                                        for (int s = 0; s < path_len; s++) {
+                                            offsets[2 + s] = nodes[path[s]].offset;
+                                        }
+                                        if (validate_chain_forward(pid, mbase, mrva, offsets, (uint8_t)cur_depth, target_addr)) {
+                                            bool is_dup = false;
+                                            for (uint32_t d = 0; d < chain_count; d++) {
+                                                if (out[d].module_base == mbase && out[d].rva == mrva && out[d].depth == cur_depth) {
+                                                    bool omatch = true;
+                                                    for (int k = 0; k <= cur_depth; k++) {
+                                                        if (out[d].offsets[k] != offsets[k]) { omatch = false; break; }
+                                                    }
+                                                    if (omatch) { is_dup = true; break; }
+                                                }
+                                            }
+                                            if (!is_dup && chain_count < max_results) {
+                                                snprintf(out[chain_count].module, sizeof(out[chain_count].module), "%s", mod);
+                                                out[chain_count].module_base = mbase;
+                                                out[chain_count].rva = mrva;
+                                                out[chain_count].entry_addr = paddr;
+                                                out[chain_count].depth = (uint8_t)cur_depth;
+                                                uint32_t tot = 0;
+                                                for (int k = 0; k <= cur_depth; k++) {
+                                                    out[chain_count].offsets[k] = offsets[k];
+                                                    tot += offsets[k];
+                                                }
+                                                out[chain_count].total_offset = tot;
+                                                out[chain_count].verified = true;
+                                                chain_count++;
+                                            }
+                                        }
+                                    }
+                                } else if (cur_depth < max_depth) {
+                                    if (node_count < BFS_MAX_NODES) {
+                                        nodes[node_count].addr = paddr;
+                                        nodes[node_count].ptr_val = val;
+                                        nodes[node_count].offset = (uint32_t)(caddr - val);
+                                        nodes[node_count].parent_idx = cand_items[c].node_idx;
+                                        nodes[node_count].depth = (uint8_t)cur_depth;
+                                        node_count++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    got += span;
+                }
+                cur += want;
+            }
+        }
+    }
+
+    free(chunk);
+    free(ranges);
+    free(nodes);
+    free(visited);
+    vma_table_free(&t);
+
+    qsort(out, chain_count, sizeof(struct auto_chain_result), cmp_chain_result);
+    return chain_count;
+}
+
+static int cmd_ptr_chain_auto(int pid, uint64_t target_addr, int max_depth,
+                              uint32_t max_offset, uint32_t max_results,
+                              const char *filter_module, const char *filter_perms) {
+    if (max_depth <= 0) max_depth = 4;
+    if (max_offset == 0) max_offset = 0x400;
+    if (max_results == 0) max_results = 10;
+    if (!filter_perms || !filter_perms[0]) filter_perms = "rw-p";
+
+    struct auto_chain_result *results = (struct auto_chain_result *)calloc(max_results, sizeof(struct auto_chain_result));
+    if (!results) {
+        print_error("Out of memory", ENOMEM);
+        return 1;
+    }
+
+    uint32_t count = run_ptr_chain_auto(pid, target_addr, max_depth, max_offset,
+                                        max_results, filter_module, filter_perms, results);
+
+    printf("{\"status\":\"ok\",\"pid\":%d,\"target_addr\":\"0x%llx\",\"chains_found\":%u,\"chains\":[",
+           pid, (unsigned long long)target_addr, count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        printf("%s{\"module\":\"%s\",\"base\":\"0x%llx\",\"rva\":\"0x%llx\",\"address\":\"0x%llx\","
+               "\"depth\":%u,\"offsets\":[",
+               i ? "," : "",
+               results[i].module,
+               (unsigned long long)results[i].module_base,
+               (unsigned long long)results[i].rva,
+               (unsigned long long)results[i].entry_addr,
+               results[i].depth);
+        int off_count = (int)results[i].depth + 1;
+        for (int k = 0; k < off_count; k++) {
+            printf("%s%u", k ? "," : "", results[i].offsets[k]);
+        }
+        printf("],\"offsets_hex\":[");
+        for (int k = 0; k < off_count; k++) {
+            printf("%s\"0x%x\"", k ? "," : "", results[i].offsets[k]);
+        }
+        printf("],\"verified\":%s", results[i].verified ? "true" : "false");
+
+        // cli_command helper
+        printf(",\"cli_command\":\"pointer_chain %d %s 0x%llx i32",
+               pid, results[i].module, (unsigned long long)results[i].rva);
+        for (int k = 0; k < off_count; k++) {
+            printf(" 0x%x", results[i].offsets[k]);
+        }
+        printf("\"");
+
+        // lua_call helper
+        printf(",\"lua_call\":\"hm.chain(\\\"%s\\\", 0x%llx, {",
+               results[i].module, (unsigned long long)results[i].rva);
+        for (int k = 0; k < off_count; k++) {
+            printf("%s0x%x", k ? ", " : "", results[i].offsets[k]);
+        }
+        printf("})\"");
+
+        printf("}");
+    }
+    printf("]}\n");
+    free(results);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Structure layout search (anchor + SIMD kernel scan + chunked verification)
+// ---------------------------------------------------------------------------
+
+#define MAX_PATTERN_FIELDS 16
+
+enum field_op {
+    FIELD_OP_EXACT,
+    FIELD_OP_RANGE,
+    FIELD_OP_GT,
+    FIELD_OP_LT,
+    FIELD_OP_GTE,
+    FIELD_OP_LTE,
+    FIELD_OP_NE,
+    FIELD_OP_ANY,
+};
+
+struct pattern_field {
+    int32_t offset;
+    uint8_t type;
+    uint8_t elem_size;
+    enum field_op op;
+    union {
+        int64_t i;
+        uint64_t u;
+        float f;
+        double d;
+    } val_min;
+    union {
+        int64_t i;
+        uint64_t u;
+        float f;
+        double d;
+    } val_max;
+    bool is_float;
+    bool is_exact;
+};
+
+struct struct_hit {
+    uint64_t addr;
+    uint8_t raw_fields[MAX_PATTERN_FIELDS][8];
+};
+
+static const char *type_name_from_code(uint8_t type) {
+    switch (type) {
+        case HMKPM_SCAN_TYPE_I8:  return "i8";
+        case HMKPM_SCAN_TYPE_U8:  return "u8";
+        case HMKPM_SCAN_TYPE_I16: return "i16";
+        case HMKPM_SCAN_TYPE_U16: return "u16";
+        case HMKPM_SCAN_TYPE_I32: return "i32";
+        case HMKPM_SCAN_TYPE_U32: return "u32";
+        case HMKPM_SCAN_TYPE_I64: return "i64";
+        case HMKPM_SCAN_TYPE_U64: return "u64";
+        case HMKPM_SCAN_TYPE_F32: return "f32";
+        case HMKPM_SCAN_TYPE_F64: return "f64";
+        default: return "unknown";
+    }
+}
+
+static void print_typed_json(uint8_t type, const uint8_t *raw) {
+    if (scan_type_is_float(type)) {
+        if (type == HMKPM_SCAN_TYPE_F32) {
+            float f = *(const float *)raw;
+            if (isnan(f)) printf("\"NaN\"");
+            else if (isinf(f)) printf("\"Inf\"");
+            else printf("%.7g", f);
+        } else {
+            double d = *(const double *)raw;
+            if (isnan(d)) printf("\"NaN\"");
+            else if (isinf(d)) printf("\"Inf\"");
+            else printf("%.15g", d);
+        }
+    } else if (type == HMKPM_SCAN_TYPE_U64 || type == HMKPM_SCAN_TYPE_U32 ||
+               type == HMKPM_SCAN_TYPE_U16 || type == HMKPM_SCAN_TYPE_U8) {
+        uint64_t u = 0;
+        if (type == HMKPM_SCAN_TYPE_U8) u = *raw;
+        else if (type == HMKPM_SCAN_TYPE_U16) u = *(const uint16_t *)raw;
+        else if (type == HMKPM_SCAN_TYPE_U32) u = *(const uint32_t *)raw;
+        else memcpy(&u, raw, 8);
+        printf("%llu", (unsigned long long)u);
+    } else {
+        int64_t i = 0;
+        if (type == HMKPM_SCAN_TYPE_I8) i = *(const int8_t *)raw;
+        else if (type == HMKPM_SCAN_TYPE_I16) i = *(const int16_t *)raw;
+        else if (type == HMKPM_SCAN_TYPE_I32) i = *(const int32_t *)raw;
+        else memcpy(&i, raw, 8);
+        printf("%lld", (long long)i);
+    }
+}
+
+static int parse_struct_pattern(const char *pattern, struct pattern_field *fields, int max_fields) {
+    char *copy = strdup(pattern);
+    if (!copy) return 0;
+    char *token = strtok(copy, ",");
+    int count = 0;
+    while (token && count < max_fields) {
+        while (*token == ' ') token++;
+        char *end = token + strlen(token) - 1;
+        while (end > token && (*end == ' ' || *end == '\r' || *end == '\n')) *end-- = '\0';
+        if (*token) {
+            char *colon1 = strchr(token, ':');
+            if (!colon1) { token = strtok(NULL, ","); continue; }
+            *colon1 = '\0';
+            char *type_str = colon1 + 1;
+            char *colon2 = strchr(type_str, ':');
+            if (!colon2) { token = strtok(NULL, ","); continue; }
+            *colon2 = '\0';
+            char *spec_str = colon2 + 1;
+
+            fields[count].offset = (int32_t)strtol(token, NULL, 0);
+
+            if (strcmp(type_str, "ptr") == 0) {
+                fields[count].type = HMKPM_SCAN_TYPE_U64;
+                fields[count].elem_size = 8;
+                fields[count].is_float = false;
+            } else {
+                uint8_t es = 4, al = 4;
+                uint8_t tcode = scan_type_from_name(type_str, &es, &al);
+                if (tcode == 0) { free(copy); return -1; }
+                fields[count].type = tcode;
+                fields[count].elem_size = es;
+                fields[count].is_float = scan_type_is_float(tcode);
+            }
+
+            if (strcmp(spec_str, "?") == 0 || strcmp(spec_str, "*") == 0 || strcmp(spec_str, "any") == 0) {
+                fields[count].op = FIELD_OP_ANY;
+                fields[count].is_exact = false;
+            } else if (strncmp(spec_str, "!=", 2) == 0) {
+                fields[count].op = FIELD_OP_NE;
+                fields[count].is_exact = false;
+                if (fields[count].is_float) {
+                    if (fields[count].type == HMKPM_SCAN_TYPE_F32) fields[count].val_min.f = strtof(spec_str + 2, NULL);
+                    else fields[count].val_min.d = strtod(spec_str + 2, NULL);
+                } else {
+                    fields[count].val_min.u = (uint64_t)strtoull(spec_str + 2, NULL, 0);
+                }
+            } else if (strchr(spec_str, '~') != NULL) {
+                fields[count].op = FIELD_OP_RANGE;
+                fields[count].is_exact = false;
+                char *tilde = strchr(spec_str, '~');
+                *tilde = '\0';
+                const char *min_s = spec_str;
+                const char *max_s = tilde + 1;
+                if (fields[count].is_float) {
+                    if (fields[count].type == HMKPM_SCAN_TYPE_F32) {
+                        fields[count].val_min.f = strtof(min_s, NULL);
+                        fields[count].val_max.f = strtof(max_s, NULL);
+                    } else {
+                        fields[count].val_min.d = strtod(min_s, NULL);
+                        fields[count].val_max.d = strtod(max_s, NULL);
+                    }
+                } else {
+                    fields[count].val_min.i = (int64_t)strtoll(min_s, NULL, 0);
+                    fields[count].val_max.i = (int64_t)strtoll(max_s, NULL, 0);
+                }
+            } else if (strncmp(spec_str, ">=", 2) == 0) {
+                fields[count].op = FIELD_OP_GTE;
+                fields[count].is_exact = false;
+                if (fields[count].is_float) {
+                    if (fields[count].type == HMKPM_SCAN_TYPE_F32) fields[count].val_min.f = strtof(spec_str + 2, NULL);
+                    else fields[count].val_min.d = strtod(spec_str + 2, NULL);
+                } else {
+                    fields[count].val_min.i = (int64_t)strtoll(spec_str + 2, NULL, 0);
+                }
+            } else if (strncmp(spec_str, "<=", 2) == 0) {
+                fields[count].op = FIELD_OP_LTE;
+                fields[count].is_exact = false;
+                if (fields[count].is_float) {
+                    if (fields[count].type == HMKPM_SCAN_TYPE_F32) fields[count].val_min.f = strtof(spec_str + 2, NULL);
+                    else fields[count].val_min.d = strtod(spec_str + 2, NULL);
+                } else {
+                    fields[count].val_min.i = (int64_t)strtoll(spec_str + 2, NULL, 0);
+                }
+            } else if (spec_str[0] == '>') {
+                fields[count].op = FIELD_OP_GT;
+                fields[count].is_exact = false;
+                if (fields[count].is_float) {
+                    if (fields[count].type == HMKPM_SCAN_TYPE_F32) fields[count].val_min.f = strtof(spec_str + 1, NULL);
+                    else fields[count].val_min.d = strtod(spec_str + 1, NULL);
+                } else {
+                    fields[count].val_min.i = (int64_t)strtoll(spec_str + 1, NULL, 0);
+                }
+            } else if (spec_str[0] == '<') {
+                fields[count].op = FIELD_OP_LT;
+                fields[count].is_exact = false;
+                if (fields[count].is_float) {
+                    if (fields[count].type == HMKPM_SCAN_TYPE_F32) fields[count].val_min.f = strtof(spec_str + 1, NULL);
+                    else fields[count].val_min.d = strtod(spec_str + 1, NULL);
+                } else {
+                    fields[count].val_min.i = (int64_t)strtoll(spec_str + 1, NULL, 0);
+                }
+            } else {
+                fields[count].op = FIELD_OP_EXACT;
+                fields[count].is_exact = true;
+                if (fields[count].is_float) {
+                    if (fields[count].type == HMKPM_SCAN_TYPE_F32) {
+                        fields[count].val_min.f = strtof(spec_str, NULL);
+                    } else {
+                        fields[count].val_min.d = strtod(spec_str, NULL);
+                    }
+                } else {
+                    fields[count].val_min.u = (uint64_t)strtoull(spec_str, NULL, 0);
+                }
+            }
+            count++;
+        }
+        token = strtok(NULL, ",");
+    }
+    free(copy);
+    return count;
+}
+
+static bool match_field(const struct pattern_field *pf, const uint8_t *raw) {
+    if (pf->op == FIELD_OP_ANY) return true;
+    if (pf->is_float) {
+        double val = (pf->type == HMKPM_SCAN_TYPE_F32) ?
+                     (double)(*(const float *)raw) : (*(const double *)raw);
+        if (isnan(val)) return false;
+        double target = (pf->type == HMKPM_SCAN_TYPE_F32) ? (double)pf->val_min.f : pf->val_min.d;
+        double target_max = (pf->type == HMKPM_SCAN_TYPE_F32) ? (double)pf->val_max.f : pf->val_max.d;
+        switch (pf->op) {
+            case FIELD_OP_EXACT: return fabs(val - target) < 0.0001;
+            case FIELD_OP_RANGE: return (val >= target && val <= target_max);
+            case FIELD_OP_GT: return val > target;
+            case FIELD_OP_LT: return val < target;
+            case FIELD_OP_GTE: return val >= target;
+            case FIELD_OP_LTE: return val <= target;
+            case FIELD_OP_NE: return fabs(val - target) >= 0.0001;
+            default: return false;
+        }
+    } else {
+        bool is_unsigned = (pf->type == HMKPM_SCAN_TYPE_U8 || pf->type == HMKPM_SCAN_TYPE_U16 ||
+                            pf->type == HMKPM_SCAN_TYPE_U32 || pf->type == HMKPM_SCAN_TYPE_U64);
+        if (is_unsigned) {
+            uint64_t uval = 0;
+            switch (pf->elem_size) {
+                case 1: uval = *raw; break;
+                case 2: uval = *(const uint16_t *)raw; break;
+                case 4: uval = *(const uint32_t *)raw; break;
+                case 8: memcpy(&uval, raw, 8); break;
+            }
+            switch (pf->op) {
+                case FIELD_OP_EXACT: return uval == pf->val_min.u;
+                case FIELD_OP_RANGE: return (uval >= pf->val_min.u && uval <= (uint64_t)pf->val_max.i);
+                case FIELD_OP_GT: return uval > pf->val_min.u;
+                case FIELD_OP_LT: return uval < pf->val_min.u;
+                case FIELD_OP_GTE: return uval >= pf->val_min.u;
+                case FIELD_OP_LTE: return uval <= pf->val_min.u;
+                case FIELD_OP_NE: return uval != pf->val_min.u;
+                default: return false;
+            }
+        } else {
+            int64_t ival = 0;
+            switch (pf->elem_size) {
+                case 1: ival = *(const int8_t *)raw; break;
+                case 2: ival = *(const int16_t *)raw; break;
+                case 4: ival = *(const int32_t *)raw; break;
+                case 8: memcpy(&ival, raw, 8); break;
+            }
+            switch (pf->op) {
+                case FIELD_OP_EXACT: return ival == pf->val_min.i;
+                case FIELD_OP_RANGE: return (ival >= pf->val_min.i && ival <= pf->val_max.i);
+                case FIELD_OP_GT: return ival > pf->val_min.i;
+                case FIELD_OP_LT: return ival < pf->val_min.i;
+                case FIELD_OP_GTE: return ival >= pf->val_min.i;
+                case FIELD_OP_LTE: return ival <= pf->val_min.i;
+                case FIELD_OP_NE: return ival != pf->val_min.i;
+                default: return false;
+            }
+        }
+    }
+}
+
+static uint32_t run_struct_search(int pid, const struct pattern_field *fields, int field_count,
+                                  const char *filter_perms, uint32_t max_matches, int align,
+                                  struct struct_hit *hits) {
+    if (!hits || max_matches == 0 || field_count <= 0) return 0;
+    if (align <= 0) align = 4;
+    if (!filter_perms || !filter_perms[0]) filter_perms = "rw-p";
+
+    uint32_t range_count = 0;
+    struct hmkpm_scan_range *ranges = collect_ranges_alloc(pid, filter_perms, &range_count);
+    if (!ranges || range_count == 0) {
+        free(ranges);
+        return 0;
+    }
+
+    // Anchor selection: choose best exact field
+    int best_anchor = -1;
+    int best_score = -1;
+    for (int i = 0; i < field_count; i++) {
+        if (fields[i].op == FIELD_OP_EXACT) {
+            int score = fields[i].elem_size * 10;
+            if (fields[i].val_min.u != 0) score += 100;
+            if (score > best_score) {
+                best_score = score;
+                best_anchor = i;
+            }
+        }
+    }
+
+    uint32_t hits_count = 0;
+
+    // Fast path: kernel SIMD scan on anchor
+    if (best_anchor >= 0) {
+        uint64_t criteria_val = 0;
+        if (fields[best_anchor].is_float) {
+            memcpy(&criteria_val, &fields[best_anchor].val_min.f, fields[best_anchor].elem_size);
+        } else {
+            memcpy(&criteria_val, &fields[best_anchor].val_min.u, fields[best_anchor].elem_size);
+        }
+        uint64_t found = 0;
+        uint32_t reported = 0;
+        uint64_t *kmatches = NULL;
+        uint32_t cap = 8192;
+        if (kernel_scan_ranges(pid, fields[best_anchor].type, align, criteria_val,
+                               ranges, range_count, cap, &found, &kmatches, &reported)) {
+            for (uint32_t j = 0; j < reported && hits_count < max_matches; j++) {
+                uint64_t struct_base = kmatches[j] - fields[best_anchor].offset;
+                bool ok = true;
+                for (int k = 0; k < field_count; k++) {
+                    uint64_t faddr = struct_base + fields[k].offset;
+                    uint8_t raw[8] = {0};
+                    if (k == best_anchor) {
+                        memcpy(hits[hits_count].raw_fields[k], &criteria_val, fields[k].elem_size);
+                        continue;
+                    }
+                    if (!raw_read_exact(pid, faddr, raw, fields[k].elem_size) || !match_field(&fields[k], raw)) {
+                        ok = false;
+                        break;
+                    }
+                    memcpy(hits[hits_count].raw_fields[k], raw, fields[k].elem_size);
+                }
+                if (ok) {
+                    hits[hits_count].addr = struct_base;
+                    hits_count++;
+                }
+            }
+            free(kmatches);
+            free(ranges);
+            return hits_count;
+        }
+    }
+
+    // Chunked fallback scan with early-rejection on field 0
+    const size_t CHUNK = 2 * 1024 * 1024;
+    uint8_t *chunk = (uint8_t *)malloc(CHUNK + sizeof(struct hmkpm_req));
+    if (!chunk) {
+        free(ranges);
+        return 0;
+    }
+
+    int32_t min_off = fields[0].offset;
+    int32_t max_off = fields[0].offset;
+    for (int k = 1; k < field_count; k++) {
+        if (fields[k].offset < min_off) min_off = fields[k].offset;
+        if (fields[k].offset > max_off) max_off = fields[k].offset;
+    }
+
+    for (uint32_t r = 0; r < range_count && hits_count < max_matches; r++) {
+        uint64_t cur = ranges[r].start_va;
+        uint64_t end_va = ranges[r].start_va + ranges[r].size;
+        while (cur < end_va && hits_count < max_matches) {
+            size_t want = (size_t)(end_va - cur);
+            if (want > CHUNK) want = CHUNK;
+            struct hmkpm_req *req = (struct hmkpm_req *)chunk;
+            req->pid = pid;
+            req->size = want;
+            size_t got = 0;
+            while (got < want && hits_count < max_matches) {
+                req->addr = cur + got;
+                req->size = want - got;
+                errno = 0;
+                long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_READ, chunk, sizeof(struct hmkpm_req) + req->size);
+                size_t span;
+                if (ret >= 0 || ret == 0) {
+                    span = req->size;
+                } else if (req->size > 4096) {
+                    span = 4096;
+                } else {
+                    span = 4096;
+                    got += span;
+                    continue;
+                }
+                const uint8_t *data = chunk + sizeof(struct hmkpm_req);
+                for (size_t off = 0; off + max_off + 8 <= span && hits_count < max_matches; off += align) {
+                    if ((int64_t)off + min_off < 0) continue;
+                    const uint8_t *f0 = data + off + fields[0].offset;
+                    if (!match_field(&fields[0], f0)) continue;
+
+                    bool ok = true;
+                    for (int k = 1; k < field_count; k++) {
+                        const uint8_t *fk = data + off + fields[k].offset;
+                        if (!match_field(&fields[k], fk)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) {
+                        hits[hits_count].addr = cur + got + off;
+                        for (int k = 0; k < field_count; k++) {
+                            memcpy(hits[hits_count].raw_fields[k], data + off + fields[k].offset, fields[k].elem_size);
+                        }
+                        hits_count++;
+                    }
+                }
+                got += span;
+            }
+            cur += want;
+        }
+    }
+
+    free(chunk);
+    free(ranges);
+    return hits_count;
+}
+
+static int cmd_struct_search(int pid, const char *pattern, const char *filter_perms,
+                             uint32_t max_matches, int align) {
+    if (align <= 0) align = 4;
+    if (max_matches == 0) max_matches = 100;
+    if (!filter_perms || !filter_perms[0]) filter_perms = "rw-p";
+
+    struct pattern_field fields[MAX_PATTERN_FIELDS];
+    int field_count = parse_struct_pattern(pattern, fields, MAX_PATTERN_FIELDS);
+    if (field_count <= 0) {
+        print_error("Invalid pattern format", EINVAL);
+        return 1;
+    }
+
+    struct struct_hit *hits = (struct struct_hit *)calloc(max_matches, sizeof(struct struct_hit));
+    if (!hits) {
+        print_error("Out of memory", ENOMEM);
+        return 1;
+    }
+
+    uint32_t count = run_struct_search(pid, fields, field_count, filter_perms, max_matches, align, hits);
+
+    printf("{\"status\":\"ok\",\"pid\":%d,\"pattern\":\"%s\",\"align\":%d,\"count\":%u,\"matches\":[",
+           pid, pattern, align, count);
+
+    for (uint32_t i = 0; i < count; i++) {
+        printf("%s{\"addr\":\"0x%llx\",\"fields\":[", i ? "," : "", (unsigned long long)hits[i].addr);
+        for (int k = 0; k < field_count; k++) {
+            printf("%s{\"offset\":\"0x%x\",\"type\":\"%s\",\"value\":",
+                   k ? "," : "", fields[k].offset, type_name_from_code(fields[k].type));
+            print_typed_json(fields[k].type, hits[i].raw_fields[k]);
+            printf("}");
+        }
+        printf("]}");
+    }
+    printf("]}\n");
+    free(hits);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Value freezing.
 //
 // A frozen value has to be rewritten continuously: the app overwrites the slot
@@ -3095,20 +4127,204 @@ static int lua_hm_sleep(lua_State *L) {
     return 0;
 }
 
+// hm.ptr_scan(target_addr, [opts]) -> array of matches
+// opts: max_offset (default 0), limit (default 256), align (default 8), perms (default "rw-p")
+static int lua_hm_ptr_scan(lua_State *L) {
+    uint64_t target_addr = lua_to_addr(L, 1);
+    uint32_t max_offset = 0;
+    uint32_t limit = 256;
+    uint8_t align = 8;
+    char perms_buf[16] = "rw-p";
+    if (lua_istable(L, 2)) {
+        lua_getfield(L, 2, "max_offset");
+        if (lua_isnumber(L, -1)) max_offset = (uint32_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "limit");
+        if (lua_isnumber(L, -1)) limit = (uint32_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "align");
+        if (lua_isnumber(L, -1)) align = (uint8_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "perms");
+        if (lua_isstring(L, -1)) snprintf(perms_buf, sizeof(perms_buf), "%s", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    struct vma_table t;
+    if (!vma_table_load(g_lua_pid, &t)) {
+        lua_pushnil(L); lua_pushinteger(L, errno); return 2;
+    }
+    struct ptr_match *matches = (struct ptr_match *)calloc(limit, sizeof(struct ptr_match));
+    if (!matches) {
+        vma_table_free(&t);
+        lua_pushnil(L); lua_pushinteger(L, ENOMEM); return 2;
+    }
+    uint32_t count = scan_pointers_internal(g_lua_pid, &t, target_addr, max_offset,
+                                           align, perms_buf, matches, limit);
+    vma_table_free(&t);
+
+    lua_createtable(L, count, 0);
+    for (uint32_t i = 0; i < count; i++) {
+        lua_createtable(L, 0, 7);
+        lua_pushinteger(L, (lua_Integer)matches[i].addr);
+        lua_setfield(L, -2, "addr");
+        lua_pushinteger(L, (lua_Integer)matches[i].ptr_val);
+        lua_setfield(L, -2, "ptr_val");
+        lua_pushinteger(L, matches[i].offset);
+        lua_setfield(L, -2, "offset");
+        lua_pushboolean(L, matches[i].is_static ? 1 : 0);
+        lua_setfield(L, -2, "is_static");
+        if (matches[i].is_static) {
+            lua_pushstring(L, matches[i].module);
+            lua_setfield(L, -2, "module");
+            lua_pushinteger(L, (lua_Integer)matches[i].module_base);
+            lua_setfield(L, -2, "base");
+            lua_pushinteger(L, (lua_Integer)matches[i].rva);
+            lua_setfield(L, -2, "rva");
+        }
+        lua_rawseti(L, -2, i + 1);
+    }
+    free(matches);
+    return 1;
+}
+
+// hm.ptr_chain(target_addr, [opts]) -> array of chains
+// opts: max_depth (default 4), max_offset (default 0x400), limit (default 10), module (filter), perms
+static int lua_hm_ptr_chain(lua_State *L) {
+    uint64_t target_addr = lua_to_addr(L, 1);
+    int max_depth = 4;
+    uint32_t max_offset = 0x400;
+    uint32_t limit = 10;
+    char mod_buf[64] = {0};
+    const char *module = NULL;
+    char perms_buf[16] = "rw-p";
+    if (lua_istable(L, 2)) {
+        lua_getfield(L, 2, "max_depth");
+        if (lua_isnumber(L, -1)) max_depth = (int)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "max_offset");
+        if (lua_isnumber(L, -1)) max_offset = (uint32_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "limit");
+        if (lua_isnumber(L, -1)) limit = (uint32_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "module");
+        if (lua_isstring(L, -1)) {
+            snprintf(mod_buf, sizeof(mod_buf), "%s", lua_tostring(L, -1));
+            module = mod_buf;
+        }
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "perms");
+        if (lua_isstring(L, -1)) snprintf(perms_buf, sizeof(perms_buf), "%s", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+
+    struct auto_chain_result *results = (struct auto_chain_result *)calloc(limit, sizeof(struct auto_chain_result));
+    if (!results) { lua_pushnil(L); lua_pushinteger(L, ENOMEM); return 2; }
+
+    uint32_t count = run_ptr_chain_auto(g_lua_pid, target_addr, max_depth, max_offset,
+                                        limit, module, perms_buf, results);
+
+    lua_createtable(L, count, 0);
+    for (uint32_t i = 0; i < count; i++) {
+        lua_createtable(L, 0, 7);
+        lua_pushstring(L, results[i].module);
+        lua_setfield(L, -2, "module");
+        lua_pushinteger(L, (lua_Integer)results[i].module_base);
+        lua_setfield(L, -2, "base");
+        lua_pushinteger(L, (lua_Integer)results[i].rva);
+        lua_setfield(L, -2, "rva");
+        lua_pushinteger(L, (lua_Integer)results[i].entry_addr);
+        lua_setfield(L, -2, "address");
+        lua_pushinteger(L, results[i].depth);
+        lua_setfield(L, -2, "depth");
+
+        int off_count = (int)results[i].depth + 1;
+        lua_createtable(L, off_count, 0);
+        for (int k = 0; k < off_count; k++) {
+            lua_pushinteger(L, results[i].offsets[k]);
+            lua_rawseti(L, -2, k + 1);
+        }
+        lua_setfield(L, -2, "offsets");
+        lua_pushboolean(L, results[i].verified ? 1 : 0);
+        lua_setfield(L, -2, "verified");
+
+        lua_rawseti(L, -2, i + 1);
+    }
+    free(results);
+    return 1;
+}
+
+// hm.struct_search(pattern, [opts]) -> array of hits
+// opts: limit (default 100), align (default 4), perms (default "rw-p")
+static int lua_hm_struct_search(lua_State *L) {
+    const char *pattern = luaL_checkstring(L, 1);
+    uint32_t limit = 100;
+    int align = 4;
+    char perms_buf[16] = "rw-p";
+    if (lua_istable(L, 2)) {
+        lua_getfield(L, 2, "limit");
+        if (lua_isnumber(L, -1)) limit = (uint32_t)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "align");
+        if (lua_isnumber(L, -1)) align = (int)lua_tointeger(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 2, "perms");
+        if (lua_isstring(L, -1)) snprintf(perms_buf, sizeof(perms_buf), "%s", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+
+    struct pattern_field fields[MAX_PATTERN_FIELDS];
+    int field_count = parse_struct_pattern(pattern, fields, MAX_PATTERN_FIELDS);
+    if (field_count <= 0) {
+        lua_pushnil(L); lua_pushinteger(L, EINVAL); return 2;
+    }
+
+    struct struct_hit *hits = (struct struct_hit *)calloc(limit, sizeof(struct struct_hit));
+    if (!hits) { lua_pushnil(L); lua_pushinteger(L, ENOMEM); return 2; }
+
+    uint32_t count = run_struct_search(g_lua_pid, fields, field_count, perms_buf, limit, align, hits);
+
+    lua_createtable(L, count, 0);
+    for (uint32_t i = 0; i < count; i++) {
+        lua_createtable(L, 0, 2);
+        lua_pushinteger(L, (lua_Integer)hits[i].addr);
+        lua_setfield(L, -2, "addr");
+
+        lua_createtable(L, field_count, 0);
+        for (int k = 0; k < field_count; k++) {
+            lua_createtable(L, 0, 3);
+            lua_pushinteger(L, fields[k].offset);
+            lua_setfield(L, -2, "offset");
+            lua_pushstring(L, type_name_from_code(fields[k].type));
+            lua_setfield(L, -2, "type");
+            lua_push_typed(L, fields[k].type, hits[i].raw_fields[k]);
+            lua_setfield(L, -2, "value");
+            lua_rawseti(L, -2, k + 1);
+        }
+        lua_setfield(L, -2, "fields");
+        lua_rawseti(L, -2, i + 1);
+    }
+    free(hits);
+    return 1;
+}
+
 static const luaL_Reg hm_funcs[] = {
-    { "read",        lua_hm_read },
-    { "write",       lua_hm_write },
-    { "read_bytes",  lua_hm_read_bytes },
-    { "write_bytes", lua_hm_write_bytes },
-    { "chain",       lua_hm_chain },
-    { "scan",        lua_hm_scan },
-    { "freeze",      lua_hm_freeze },
-    { "unfreeze",    lua_hm_unfreeze },
-    { "module",      lua_hm_module },
-    { "map",         lua_hm_map },
-    { "b64",         lua_hm_b64 },
-    { "log",         lua_hm_log },
-    { "sleep",       lua_hm_sleep },
+    { "read",          lua_hm_read },
+    { "write",         lua_hm_write },
+    { "read_bytes",    lua_hm_read_bytes },
+    { "write_bytes",   lua_hm_write_bytes },
+    { "chain",         lua_hm_chain },
+    { "ptr_scan",      lua_hm_ptr_scan },
+    { "ptr_chain",     lua_hm_ptr_chain },
+    { "struct_search", lua_hm_struct_search },
+    { "scan",          lua_hm_scan },
+    { "freeze",        lua_hm_freeze },
+    { "unfreeze",      lua_hm_unfreeze },
+    { "module",        lua_hm_module },
+    { "map",           lua_hm_map },
+    { "b64",           lua_hm_b64 },
+    { "log",           lua_hm_log },
+    { "sleep",         lua_hm_sleep },
     { NULL, NULL },
 };
 
@@ -3403,6 +4619,9 @@ int main(int argc, char **argv) {
                "  find_string  <pid> <needle> [perms] [limit]\n"
                "  module_base  <pid> <module> [rva]\n"
                "  pointer_chain <pid> <module|0xaddr> <rva> <type> [off ...]  (last offset not dereferenced)\n"
+               "  ptr_scan     <pid> <target_addr> [max_offset] [max_matches] [align] [filter_perms]\n"
+               "  ptr_chain_auto <pid> <target_addr> [max_depth] [max_offset] [max_matches] [module] [filter_perms]\n"
+               "  struct_search <pid> <pattern> [filter_perms] [max_matches] [align]\n"
                "  scan_rva     <pid> <module> <type> <value> [align]          (reports offsets, not addresses)\n"
                "  find_instructions <pid> <pattern[/mask]> <module|x-perms> [limit]\n"
                "  dump         <pid> <addr|module:NAME> <size|all> <out_path> [perms]\n"
@@ -3516,6 +4735,33 @@ int main(int argc, char **argv) {
         // pointer_chain <pid> <base_module|0xaddr> <rva> <type> [off ...]
         return cmd_pointer_chain(atoi(argv[2]), argv[3], argv[4], argv[5],
                                  argc - 6, &argv[6]);
+    } else if (strcmp(cmd, "ptr_scan") == 0 && argc >= 4) {
+        // ptr_scan <pid> <target_addr> [max_offset] [max_matches] [align] [filter_perms]
+        int pid = atoi(argv[2]);
+        uint64_t target_addr = strtoull(argv[3], NULL, 0);
+        uint32_t max_offset = argc >= 5 ? (uint32_t)strtoul(argv[4], NULL, 0) : 0;
+        uint32_t max_matches = argc >= 6 ? (uint32_t)strtoul(argv[5], NULL, 0) : 256;
+        int align = argc >= 7 ? atoi(argv[6]) : 8;
+        const char *fp = argc >= 8 ? argv[7] : "rw-p";
+        return cmd_ptr_scan(pid, target_addr, max_offset, max_matches, align, fp);
+    } else if (strcmp(cmd, "ptr_chain_auto") == 0 && argc >= 4) {
+        // ptr_chain_auto <pid> <target_addr> [max_depth] [max_offset] [max_matches] [module] [filter_perms]
+        int pid = atoi(argv[2]);
+        uint64_t target_addr = strtoull(argv[3], NULL, 0);
+        int max_depth = argc >= 5 ? atoi(argv[4]) : 4;
+        uint32_t max_offset = argc >= 6 ? (uint32_t)strtoul(argv[5], NULL, 0) : 0x400;
+        uint32_t max_matches = argc >= 7 ? (uint32_t)strtoul(argv[6], NULL, 0) : 10;
+        const char *mod = argc >= 8 ? argv[7] : NULL;
+        const char *fp = argc >= 9 ? argv[8] : "rw-p";
+        return cmd_ptr_chain_auto(pid, target_addr, max_depth, max_offset, max_matches, mod, fp);
+    } else if (strcmp(cmd, "struct_search") == 0 && argc >= 4) {
+        // struct_search <pid> <pattern> [filter_perms] [max_matches] [align]
+        int pid = atoi(argv[2]);
+        const char *pattern = argv[3];
+        const char *fp = argc >= 5 ? argv[4] : "rw-p";
+        uint32_t max_matches = argc >= 6 ? (uint32_t)strtoul(argv[5], NULL, 0) : 100;
+        int align = argc >= 7 ? atoi(argv[6]) : 4;
+        return cmd_struct_search(pid, pattern, fp, max_matches, align);
     } else if (strcmp(cmd, "freeze_add") == 0 && argc >= 6) {
         // freeze_add <pid> <type> <value> <interval_ms> [addr ...]
         return cmd_freeze_add(atoi(argv[2]), argv[3], argv[4], atoi(argv[5]),

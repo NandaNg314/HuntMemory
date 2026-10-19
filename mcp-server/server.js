@@ -433,6 +433,147 @@ export function buildServer(options) {
     },
   );
 
+  // ptr_scan -- reverse pointer scanning
+  server.registerTool(
+    "ptr_scan",
+    {
+      title: "Reverse pointer scan targeting an address",
+      description:
+        "Scan memory to find pointers pointing directly to target_addr or into the range [target_addr - max_offset, target_addr]. " +
+        "Automatically identifies whether each pointer is in a static module (module name, base, RVA) or heap/anonymous memory.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        target_addr: z
+          .union([z.string(), z.number()])
+          .describe("Target memory address (hex string e.g. \"0x7f12345678\" or number) to find pointers to."),
+        max_offset: z
+          .union([z.string(), z.number()])
+          .default(0)
+          .describe("Maximum offset delta [target_addr - max_offset, target_addr]. Default 0 (exact pointer)."),
+        max_matches: z
+          .number()
+          .int()
+          .positive()
+          .max(5000)
+          .default(256)
+          .describe("Maximum matches to return (default 256)."),
+        align: z
+          .number()
+          .int()
+          .positive()
+          .default(8)
+          .describe("Pointer alignment in bytes (default 8 for 64-bit pointers)."),
+        perms: z
+          .string()
+          .default("rw-p")
+          .describe("Memory permission filter (default \"rw-p\")."),
+      },
+    },
+    async ({ pid, target_addr, max_offset, max_matches, align, perms }) => {
+      try {
+        return ok(await tools.ptrScan({ pid, targetAddr: target_addr, maxOffset: max_offset, maxMatches: max_matches, align, perms }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // ptr_chain_auto -- automatic backward BFS pointer chain tracing
+  server.registerTool(
+    "ptr_chain_auto",
+    {
+      title: "Auto-trace multi-level pointer chains to a target address",
+      description:
+        "Discover stable pointer chains from static modules to a target address using backward Breadth-First Search (BFS). " +
+        "Automatically resolves intermediate heap hops, maps roots to shared library modules (e.g. libil2cpp.so) with RVAs, " +
+        "validates chains forward, and generates ready-to-use CLI and Lua commands.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        target_addr: z
+          .union([z.string(), z.number()])
+          .describe("Target address to find pointer chains reaching it."),
+        max_depth: z
+          .number()
+          .int()
+          .min(1)
+          .max(8)
+          .default(4)
+          .describe("Maximum chain depth / indirection levels (default 4)."),
+        max_offset: z
+          .union([z.string(), z.number()])
+          .default("0x400")
+          .describe("Maximum offset allowed per dereference hop (default 0x400 / 1024)."),
+        max_matches: z
+          .number()
+          .int()
+          .positive()
+          .max(100)
+          .default(10)
+          .describe("Maximum valid pointer chains to return (default 10)."),
+        module: z
+          .string()
+          .optional()
+          .describe("Filter chains starting from a specific module name (e.g. \"libil2cpp.so\", \"libc.so\")."),
+        perms: z
+          .string()
+          .default("rw-p")
+          .describe("Memory permission filter for pointer scanning (default \"rw-p\")."),
+      },
+    },
+    async ({ pid, target_addr, max_depth, max_offset, max_matches, module, perms }) => {
+      try {
+        return ok(await tools.ptrChainAuto({ pid, targetAddr: target_addr, maxDepth: max_depth, maxOffset: max_offset, maxMatches: max_matches, module, perms }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  // struct_search -- structured memory pattern layout search
+  server.registerTool(
+    "struct_search",
+    {
+      title: "Search structured data layout patterns across memory",
+      description:
+        "Search memory for data structures matching a composite field layout specification. " +
+        "Format: comma-separated list of '+offset:type:matcher' (e.g. '+0x00:f32:0~1,+0x04:f32:0~1,+0x10:i32:100'). " +
+        "Supported types: i8..i64, u8..u64, f32, f64. " +
+        "Supported matchers: exact value (100, 3.14), range (min~max), wildcard (*), relational (<off1, >off1, ==off1, !=off1). " +
+        "Uses kernel SIMD anchor scanning for exact fields with fast chunked verification.",
+      inputSchema: {
+        pid: z.number().int().positive().describe("Target process ID."),
+        pattern: z
+          .string()
+          .min(1)
+          .describe("Structure layout pattern specification (e.g. '+0x00:f32:0~1,+0x04:f32:0~1,+0x10:i32:100')."),
+        perms: z
+          .string()
+          .default("rw-p")
+          .describe("Memory permission filter (default \"rw-p\")."),
+        max_matches: z
+          .number()
+          .int()
+          .positive()
+          .max(5000)
+          .default(100)
+          .describe("Maximum matches to return (default 100)."),
+        align: z
+          .number()
+          .int()
+          .positive()
+          .default(4)
+          .describe("Struct base address alignment in bytes (default 4)."),
+      },
+    },
+    async ({ pid, pattern, perms, max_matches, align }) => {
+      try {
+        return ok(await tools.structSearch({ pid, pattern, perms, maxMatches: max_matches, align }));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
   // 16. freeze_value -- pin addresses to a fixed value
   server.registerTool(
     "freeze_value",
@@ -602,6 +743,9 @@ export function buildServer(options) {
         "Execute a Lua script that reads and writes the target's memory through a synchronous hm.* API, in one call instead of a round trip per operation. Use it for multi-step work: scan, then filter, then confirm, then write, then re-check. The script runs OUTSIDE the target process (it is not injected); it only reaches memory through hm.*. " +
         "API: hm.pid; hm.read(addr,type) -> value|nil,errno; hm.write(addr,type,value) -> true|nil,errno; hm.read_bytes(addr,n) -> string[,unreadable_bytes] (nil,errno only when nothing is readable); hm.write_bytes(addr,str) -> true|nil; " +
         "hm.chain(base_or_module, rva, {off1,off2,...}) -> addr|nil,failed_step (last offset not dereferenced); " +
+        "hm.ptr_scan(target_addr,{max_offset,limit,align,perms}) -> {{addr,ptr_val,offset,is_static[,module,base,rva]},...}; " +
+        "hm.ptr_chain(target_addr,{max_depth,max_offset,limit,module,perms}) -> {{module,base,rva,address,depth,offsets,verified},...}; " +
+        "hm.struct_search(pattern,{limit,align,perms}) -> {{addr,fields},...}; " +
         "hm.scan(type,value,{align,perms,module,limit}) -> {{addr,value},...} (omit limit to get every hit; a small limit makes the kernel under-report); " +
         "hm.freeze(addr_list,type,value,interval_ms) -> written_count; hm.unfreeze(); hm.module(name) -> {base,stop,vmas}; hm.map(path_filter) -> {{start,stop,size,perms,path}}; " +
         "hm.b64(s); hm.log(...) (captured in the response); hm.sleep(ms). " +

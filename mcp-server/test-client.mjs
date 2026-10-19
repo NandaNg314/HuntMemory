@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 
-const child = spawn("node", ["index.js"], { cwd: import.meta.dirname, stdio: ["pipe", "pipe", "inherit"] });
+const nodeExe = process.execPath || "node";
+const child = spawn(nodeExe, ["index.js"], { cwd: import.meta.dirname, stdio: ["pipe", "pipe", "inherit"] });
 
 // When no real device/root is reachable (e.g. CI without hardware), set
 // HMKPM_TEST_OFFLINE=1 to only exercise protocol + tool registration.
@@ -72,7 +73,8 @@ const run = async () => {
     "scan_kernel",
     "scan_seed", "scan_unknown", "scan_filter", "scan_results", "scan_reset",
     "read_values", "find_string", "module_base",
-    "pointer_chain", "freeze_value", "unfreeze_value", "list_freezes",
+    "pointer_chain", "ptr_scan", "ptr_chain_auto", "struct_search",
+    "freeze_value", "unfreeze_value", "list_freezes",
     "dump_memory", "scan_rva", "find_instructions", "run_lua", "trace_watchpoint",
     "thread_suspend", "thread_resume", "thread_step", "list_threads", "set_register",
   ];
@@ -273,6 +275,7 @@ const run = async () => {
   // writable data segment, so probe that first (the i32==0 candidates above are
   // mostly padding in other segments), then fall back to them.
   let chainHop = null;
+  let targetPtr = null;
   const f = (n) => `0x${BigInt(n).toString(16)}`;
   const rwMaps = JSON.parse(
     (await callTool("list_maps", { pid, filter: "libc.so" }))
@@ -292,6 +295,7 @@ const run = async () => {
       const ptr = BigInt(item.value);
       if (ptr >= libBase && ptr < libEnd) {
         chainHop = BigInt(addrs[i]) - libBase;
+        targetPtr = ptr;
         break;
       }
     }
@@ -326,6 +330,55 @@ const run = async () => {
       .result?.content?.[0]?.text || "{}",
   );
   check("pointer_chain fails cleanly", badChain.resolved === false && badChain.failed_step === 1);
+
+  console.log("\n=== 18b. ptr_scan ===");
+  if (targetPtr !== null) {
+    const pscan = await callTool("ptr_scan", {
+      pid, target_addr: f(targetPtr), max_offset: 0x100, max_matches: 10, align: 8,
+    });
+    const pscanText = pscan.result?.content?.[0]?.text || "";
+    console.log("ptr_scan:", pscanText.slice(0, 260));
+    const pscanData = JSON.parse(pscanText || "{}");
+    check("ptr_scan reports ok status", pscanData.status === "ok");
+    check("ptr_scan returns matches[]", Array.isArray(pscanData.matches) && pscanData.count > 0);
+    check("ptr_scan match contains offset and is_static", typeof pscanData.matches?.[0]?.offset === "number" && typeof pscanData.matches?.[0]?.is_static === "boolean");
+  } else {
+    console.log("  SKIP: no target pointer found for ptr_scan");
+  }
+
+  console.log("\n=== 18c. ptr_chain_auto ===");
+  if (targetPtr !== null) {
+    const autoChain = await callTool("ptr_chain_auto", {
+      pid, target_addr: f(targetPtr), max_depth: 3, max_offset: 0x400, max_matches: 5, module: "libc.so",
+    });
+    const autoText = autoChain.result?.content?.[0]?.text || "";
+    console.log("ptr_chain_auto:", autoText.slice(0, 300));
+    const autoData = JSON.parse(autoText || "{}");
+    check("ptr_chain_auto reports ok status", autoData.status === "ok");
+    check("ptr_chain_auto returns chains[]", Array.isArray(autoData.chains));
+    if (autoData.chains_found > 0) {
+      const c0 = autoData.chains[0];
+      check("ptr_chain_auto chain has module and rva", typeof c0.module === "string" && typeof c0.rva === "string");
+      check("ptr_chain_auto chain has verified true", c0.verified === true);
+      check("ptr_chain_auto generates cli_command and lua_call", typeof c0.cli_command === "string" && typeof c0.lua_call === "string");
+    }
+  } else {
+    console.log("  SKIP: no target pointer found for ptr_chain_auto");
+  }
+
+  console.log("\n=== 18d. struct_search ===");
+  const valAtRead = JSON.parse(
+    (await callTool("read_value", { pid, address: readAddr, type: "i32" })).result?.content?.[0]?.text || "{}",
+  ).value;
+  const structHit = await callTool("struct_search", {
+    pid, pattern: `+0x00:i32:${valAtRead},+0x04:i32:*`, max_matches: 5, align: 4,
+  });
+  const structText = structHit.result?.content?.[0]?.text || "";
+  console.log("struct_search:", structText.slice(0, 260));
+  const structData = JSON.parse(structText || "{}");
+  check("struct_search reports ok status", structData.status === "ok");
+  check("struct_search returns matches[]", Array.isArray(structData.matches) && structData.count > 0);
+  check("struct_search matches have fields", Array.isArray(structData.matches?.[0]?.fields) && structData.matches[0].fields.length === 2);
 
   console.log("\n=== 19. scan_rva ===");
   const rva = await callTool("scan_rva", { pid, module: "libc.so", value: 0, type: "i32" });
@@ -403,6 +456,20 @@ const run = async () => {
       check("daemon exits after unfreeze", flist2.running === "false" && flist2.count === 0);
     }
   }
+
+  console.log("\n=== 24b. run_lua with ptr_scan & struct_search ===");
+  const luaAnalysis = await callTool("run_lua", {
+    pid,
+    script: `
+      local m = hm.map("libc.so")
+      local pscan = hm.ptr_scan(0x1000, { max_offset = 0x10, limit = 2 })
+      local ssearch = hm.struct_search("+0x00:i32:*,+0x04:i32:*", { limit = 2, align = 4 })
+      return #m > 0, type(pscan) == "table", type(ssearch) == "table"
+    `,
+    timeoutS: 15,
+  });
+  const luaAnaData = JSON.parse(luaAnalysis.result?.content?.[0]?.text || "{}");
+  check("run_lua hm.ptr_scan & hm.struct_search callable", luaAnaData.ok === true && luaAnaData.returns?.[1] === true && luaAnaData.returns?.[2] === true);
 
   // --- Lua scripting ------------------------------------------------------
   // A script replaces what would otherwise be several round trips. These checks

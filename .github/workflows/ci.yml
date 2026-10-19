@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test-mcp:
+    name: MCP Protocol & Tool Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: mcp-server/package-lock.json
+
+      - name: Install dependencies
+        working-directory: mcp-server
+        run: npm ci
+
+      - name: Run offline test suite
+        working-directory: mcp-server
+        run: node test-client.mjs
+        env:
+          HMKPM_TEST_OFFLINE: "1"
+
+  build-cli:
+    name: Build Native ARM64 CLI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Compile hmkpm_cli (aarch64-linux-android31-clang)
+        run: |
+          NDK_PATH="${ANDROID_NDK_HOME:-$ANDROID_NDK_ROOT}"
+          $NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang \
+            -O2 -static -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations \
+            -I helper/vendor/lua \
+            helper/hmkpm_cli.c helper/vendor/lua/*.c \
+            -o helper/hmkpm_cli -lm
+          file helper/hmkpm_cli
+          ls -lh helper/hmkpm_cli
+
+      - name: Upload ELF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hmkpm_cli-arm64
+          path: helper/hmkpm_cli
+          if-no-files-found: error

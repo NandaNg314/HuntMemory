@@ -205,6 +205,53 @@ export class HmkpmTools {
     return this.device.invoke(args);
   }
 
+  // Reverse pointer scan: search for pointers targeting targetAddr within [0, maxOffset]
+  async ptrScan({ pid, targetAddr, maxOffset = 0, maxMatches = 256, align = 8, perms = "rw-p" }) {
+    if (targetAddr === undefined || targetAddr === null) throw new Error("targetAddr is required");
+    return this.device.invoke([
+      "ptr_scan",
+      String(pid),
+      asHex(targetAddr),
+      asHex(maxOffset ?? 0),
+      String(maxMatches ?? 256),
+      String(align ?? 8),
+      perms || "rw-p",
+    ]);
+  }
+
+  // Automatic multi-level pointer chain discovery via backward BFS
+  async ptrChainAuto({ pid, targetAddr, maxDepth = 4, maxOffset = 0x400, maxMatches = 10, module, perms = "rw-p" }) {
+    if (targetAddr === undefined || targetAddr === null) throw new Error("targetAddr is required");
+    const args = [
+      "ptr_chain_auto",
+      String(pid),
+      asHex(targetAddr),
+      String(maxDepth ?? 4),
+      asHex(maxOffset ?? 0x400),
+      String(maxMatches ?? 10),
+    ];
+    if (module !== undefined && module !== null && module !== "") {
+      args.push(module);
+      if (perms) args.push(perms);
+    } else if (perms && perms !== "rw-p") {
+      args.push("", perms);
+    }
+    return this.device.invoke(args);
+  }
+
+  // Search structure layouts across memory using SIMD anchor acceleration
+  async structSearch({ pid, pattern, perms = "rw-p", maxMatches = 100, align = 4 }) {
+    if (!pattern) throw new Error("pattern must not be empty");
+    return this.device.invoke([
+      "struct_search",
+      String(pid),
+      String(pattern),
+      perms || "rw-p",
+      String(maxMatches ?? 100),
+      String(align ?? 4),
+    ]);
+  }
+
   // Freeze one or more addresses at a fixed value. Runs a detached daemon on
   // the device that rewrites the slots continuously.
   async freeze({ pid, type = "i32", value, addresses, intervalMs = 50 }) {

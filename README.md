@@ -48,6 +48,9 @@ hmkpm-mcp/
 | `find_string` | 字面量字符串搜索（配置键、URL、JSON 片段），用于从字符串反查数据结构 | `pid`, `pattern`, `perms`, `limit` |
 | `module_base` | 模块加载基址 + 可选 RVA，并返回模块结束地址与 VMA 数量 | `pid`, `module`, `rva` |
 | `pointer_chain` | **多级指针链解析**：`base+rva -> [off1] -> [off2] -> ...`，最后一段偏移不解析、直接作为字段地址。基址可直接写模块名，重启后依然有效 | `pid`, `base`, `rva`, `offsets`, `type` |
+| `ptr_scan` | **反向指针搜索**：扫描指向 `target_addr` 或范围 `[target_addr - max_offset, target_addr]` 的指针，自动区分静态模块基址（带模块名与 RVA）与堆内存 | `pid`, `target_addr`, `max_offset`, `max_matches`, `align`, `perms` |
+| `ptr_chain_auto` | **多级指针链自动回溯**：以 `target_addr` 为终点执行逆向 BFS 搜索，自动穿透多层堆对象并收敛至静态模块（如 `libil2cpp.so`），自动正向校验并生成 CLI 与 Lua 命令 | `pid`, `target_addr`, `max_depth`, `max_offset`, `max_matches`, `module`, `perms` |
+| `struct_search` | **结构体布局模式搜索**：按组合字段规格（如 `+0x00:f32:0~1,+0x04:f32:0~1,+0x10:i32:100`）搜索内存结构体；支持精确值、范围、通配符与相对关系（`<off`, `>off` 等），内核 SIMD 锚点加速 | `pid`, `pattern`, `perms`, `max_matches`, `align` |
 | `freeze_value` | **数值冻结**：让守护进程持续回写指定地址，应用覆写不掉。不传 `addresses` 时冻结当前扫描会话的全部幸存地址 | `pid`, `type`, `value`, `addresses`, `intervalMs` |
 | `unfreeze_value` | 解除冻结（不传地址则全部解除，守护进程退出） | `pid`, `addresses` |
 | `list_freezes` | 查看已冻结地址、写入的字节与守护进程存活状态 | `pid` |
@@ -90,6 +93,9 @@ return #hits, #keep
 | `hm.write(addr, type, value)` | 写值，成功返回 `true` |
 | `hm.read_bytes(addr, n)` / `hm.write_bytes(addr, str)` | 原始字节读写。`read_bytes` 返回 `字符串[, 缺失字节数]`：完全读不到时返回 `nil, errno`；部分页不可读时仍返回缓冲区，第二个值告诉你有多少字节是零填充的空洞 |
 | `hm.chain(base_or_module, rva, {off1, off2, ...})` | 多级指针链，末段偏移不解析；失败返回 `nil, 第几步` |
+| `hm.ptr_scan(target_addr, [opts])` | 反向指针扫描，opts 支持 `max_offset` / `limit` / `align` / `perms`，返回 `{{addr, ptr_val, offset, is_static, module, base, rva}, ...}` |
+| `hm.ptr_chain(target_addr, [opts])` | 自动指针链回溯，opts 支持 `max_depth` / `max_offset` / `limit` / `module` / `perms`，返回 `{{module, base, rva, address, depth, offsets, verified}, ...}` |
+| `hm.struct_search(pattern, [opts])` | 结构体模式搜索，opts 支持 `limit` / `align` / `perms`，返回 `{{addr, fields}, ...}` |
 | `hm.scan(type, value, {align, perms, module, limit})` | 搜索，返回 `{{addr=..., value=...}, ...}` |
 | `hm.freeze(addr_list, type, value, interval_ms)` / `hm.unfreeze()` | 冻结/解除，与 `freeze_value` 共用同一个守护进程 |
 | `hm.module(name)` | `{base, stop, vmas}` |
@@ -120,6 +126,19 @@ pointer_chain libil2cpp.so 0x1A2B3C0 [0x18, 0x20, 0x8]
 dump_memory  libil2cpp.so -> /sdcard/lib.so
 find_instructions B9000000/FFF00000
                                          -> 找到写该字段的指令，定位更新函数
+```
+
+结构体定位与指针链自动追踪工作流：
+
+```
+-- 1. 结构体复合特征搜索（如坐标X/Y/Z + 生命值 + 队伍ID，自动借力内核 SIMD 锚点）
+struct_search <pid> "+0x00:f32:0~5000,+0x04:f32:0~5000,+0x18:i32:100,+0x20:i32:1"
+                     -> 返回目标对象基址 0x7a81002040
+
+-- 2. 一键自动逆向 BFS 追溯至模块静态基址链（自动校验每级偏移）
+ptr_chain_auto <pid> 0x7a81002040 4 0x400 5 libil2cpp.so
+                     -> 自动输出稳定指针链、CLI 命令与 Lua 调用代码：
+                     -> pointer_chain <pid> libil2cpp.so 0x3b1c20 i32 0 0x28 0x18
 ```
 
 把上面几步固化成脚本，以后一次调用完成：
