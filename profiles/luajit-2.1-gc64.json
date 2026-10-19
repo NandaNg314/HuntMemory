@@ -1,0 +1,67 @@
+{
+  "_comment": "LuaJIT 2.1 ROLLING, ARM64, GC64 mode. Every offset below is derived from the disassembly of the target's own lua_newstate / luaL_newstate; the instruction that establishes each field is cited in \"src\".",
+  "engine": "luajit",
+  "version": "2.1.ROLLING",
+  "pointer_mode": "gc64",
+  "module_hint": "liblibGameApp.so",
+  "symbols": {
+    "lua_newstate": "0xa1ef2a8",
+    "luaL_newstate": "0xa242e78",
+    "lua_newthread": "0xa1f87e0",
+    "lua_close": "0xa1ef684"
+  },
+  "lua_State": {
+    "size": 616,
+    "fields": {
+      "next":            {"off": 0x00, "type": "ptr", "src": "lua_State is the GCobj at the head of the chunk"},
+      "glref":           {"off": 0x08, "type": "u64", "src": "0xa1ef764: sturh w8,[x0,#0x9] sets the mark bits of the GC header word at +8"},
+      "top":             {"off": 0x0c, "type": "u32", "src": "0xa1ef784: str xzr,[x0,#0x50] clears top; top is a 32-bit stack index"},
+      "stack":           {"off": 0x20, "type": "ptr", "src": "0xa1ef7e4: stp x8,x8,[x20,#0x20] where x8 = state+0x10 (stack base)"},
+      "maxstack":        {"off": 0x28, "type": "ptr", "src": "0xa242ef0: ldr x8,[x19,#0x28]; sub x8,x8,#8 (stack_last)"},
+      "openupval":       {"off": 0x30, "type": "ptr", "src": "0xa1ef7d0: stp x11,x0,[x20,#0x30]"},
+      "gclist":          {"off": 0x38, "type": "ptr", "src": "0xa1ef78c: stp xzr,xzr,[x0,#0x38]"},
+      "G":               {"off": 0x10, "type": "ptr", "src": "0xa242e90: ldr x8,[x19,#0x10] then str x9,[x8,#0x160] (writes global_State field), so +0x10 is l_G"}
+    }
+  },
+  "global_State": {
+    "size": 6200,
+    "fields": {
+      "frealloc":        {"off": 0x00, "type": "ptr", "src": "0xa1ef330: str x21,[x8,#0x60]! but before that 0xa1ef564: ldr x9,[x19] (allocator fn)"},
+      "ud":              {"off": 0x08, "type": "ptr", "src": "0xa1ef350: str x20,[x8,#0x8]"},
+      "strt":            {"off": 0x18, "type": "struct", "src": "0xa1ef7a4: ldr x8,[x19,#0x48] (stringtable hash) stored to [x0,#0x48]"},
+      "l_registry":      {"off": 0x88, "type": "tvalue", "src": "0xa1eefda: stp x19,x9,[x19,#0x88] seeds the registry array at G+0x88"},
+      "gc":              {"off": 0x160, "type": "ptr", "src": "0xa242eb0: str x9,[x8,#0x160] with x8 = l_G"},
+      "jit":             {"off": 0x380, "type": "struct", "src": "0xa1ef6b4: ldr w8,[x19,#0x380] (JIT state flags)"}
+    }
+  },
+  "TValue": {
+    "size": 8,
+    "fields": {
+      "lo": {"off": 0, "type": "u32"},
+      "hi": {"off": 4, "type": "u32"}
+    },
+    "_comment": "GC64: a pointer TValue is (lo, hi) and is reconstructed as hi<<32|lo, with the heap base OR'd in when bit 47 is set. Tags live in the hi word: it == 0xFFFFFFFF marks a 32-bit int, otherwise the canonical/lightuserdata marker bits."
+  },
+  "GCstr": {
+    "size": 24,
+    "fields": {
+      "len":  {"off": 0x08, "type": "u32", "src": "GC64: next is 4 bytes at +0, hash at +4, len at +8"},
+      "hash": {"off": 0x04, "type": "u32", "src": "GC64 header packing"},
+      "data": {"off": 0x10, "type": "bytes", "src": "characters follow the 16-byte header"}
+    }
+  },
+  "GCtab": {
+    "size": 48,
+    "fields": {
+      "asize": {"off": 0x20, "type": "u32", "src": "GC64: array size lives after the 16-byte header"},
+      "hmask": {"off": 0x28, "type": "u32", "src": "node mask; node count = hmask+1"},
+      "node":  {"off": 0x30, "type": "ptr",  "src": "GC64: node array pointer (8 bytes) follows hmask"}
+    },
+    "_comment": "Node is (TValue key, TValue val) = 16 bytes in GC64, not 32."
+  },
+  "invariants": [
+    "stack <= stack_top <= stack_max",
+    "(stack_top - stack) % sizeof(TValue) == 0",
+    "TValue.it tag <= 0x0F for non-pointer values"
+  ]
+}

@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 
 #define SYS_GETRESUID 148
 
@@ -151,8 +152,28 @@ static bool raw_read_count(int pid, uint64_t addr, void *out, size_t size,
     while (done < size) {
         size_t want = size - done;
         if (want > cap) want = cap;
+        uint64_t cur = addr + done;
+
+        // Preferred transport: process_vm_readv. The kernel's own copy sees the
+        // target exactly as it does, including MTE-tagged allocations, and it
+        // succeeds on freshly committed GC pages where the KPM path can return
+        // holes. One request must stay inside a page (see raw_read_exact).
+        size_t chunk = want;
+        size_t to_page_end = (size_t)(PAGE_SIZE_ - (cur & (PAGE_SIZE_ - 1)));
+        if (chunk > to_page_end) chunk = to_page_end;
+        struct iovec local = { dst + done, chunk };
+        struct iovec remote = { (void *)cur, chunk };
+        if (process_vm_readv(pid, &local, 1, &remote, 1, 0) == (ssize_t)chunk) {
+            done += chunk;
+            continue;
+        }
+
         req->pid = pid;
-        req->addr = addr + done;
+        req->addr = cur;
+        // The KPM path only moves data when the whole request lands inside one
+        // mapping; a span that runs into the next VMA returns zeros even when
+        // both pages are readable. Keep every request within one page.
+        want = chunk;
         req->size = want;
         errno = 0;
         long ret = syscall(SYS_GETRESUID, HMKPM_MAGIC_READ, buf, sizeof(struct hmkpm_req) + want);
@@ -260,6 +281,42 @@ static void vma_table_free(struct vma_table *t) {
         t->items = NULL;
         t->count = 0;
     }
+}
+
+// Parse a hex/decimal address given on the command line.
+//
+// strtoull with base 0 overflows on a 60-bit MTE-tagged pointer (0x00B4...)
+// and returns ULLONG_MAX, which silently turns into -1. Addresses are 48-bit on
+// arm64, so the tag byte is masked off before conversion and the result is
+// never wider than 56 bits.
+static uint64_t parse_addr(const char *s) {
+    if (!s) return 0;
+    while (*s == ' ') s++;
+    bool hex = (s[0] == '0' && (s[1] == 'x' || s[1] == 'X'));
+    if (!hex) return strtoull(s, NULL, 10);
+    s += 2;
+    while (*s == '0') s++;
+
+    // Use a copy so the scan can find where the digits stop without depending
+    // on the caller's buffer still being alive.
+    char buf[24];
+    size_t n = 0;
+    while (s[n] && n < sizeof(buf) - 1) { buf[n] = s[n]; n++; }
+    buf[n] = '\0';
+
+    uint64_t v = 0;
+    for (size_t i = 0; i < n; i++) {
+        int d;
+        if (buf[i] >= '0' && buf[i] <= '9') d = buf[i] - '0';
+        else if (buf[i] >= 'a' && buf[i] <= 'f') d = buf[i] - 'a' + 10;
+        else if (buf[i] >= 'A' && buf[i] <= 'F') d = buf[i] - 'A' + 10;
+        else break;
+        v = (v << 4) | (uint64_t)d;
+    }
+    // The mask must be a 64-bit literal: 0x0000FFFFFFFFFFFFULL is fine, but
+    // storing the result through a narrower type is not, so return the masked
+    // value as a uint64_t explicitly.
+    return (uint64_t)(v & 0x0000FFFFFFFFFFFFULL);
 }
 
 // Parse the maps file once. Returns false only when the file is unreadable
@@ -4116,7 +4173,7 @@ static int lua_hm_log(lua_State *L) {
     return 0;
 }
 
-// hm.sleep(ms) â€” a script that polls a changing value needs to wait, and there
+// hm.sleep(ms) ï¿?a script that polls a changing value needs to wait, and there
 // is no os library visible to it.
 static int lua_hm_sleep(lua_State *L) {
     lua_Integer ms = luaL_checkinteger(L, 1);
@@ -4594,6 +4651,14 @@ static int cmd_processes(void) {
 
 #include "hwbp.c"
 
+// Target-process Lua introspection and ptrace remote execution. Declared here
+// so every helper it needs (raw_read, vma_table, module_lookup, now_ms,
+// json_escape) is already in scope.
+#include "lua_vm.h"
+#include "lua_probe.h"
+#include "lua_vm_cmd.h"
+#include "lua_scan_anchor.h"
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         printf("HMKPM CLI Utility v1.2\n"
@@ -4643,6 +4708,11 @@ int main(int argc, char **argv) {
     }
 
     const char *cmd = argv[1];
+    if (strcmp(cmd, "_addr") == 0 && argc >= 3) {
+        printf("{\"in\":\"%s\",\"out\":\"0x%llx\"}\n", argv[2],
+               (unsigned long long)parse_addr(argv[2]));
+        return 0;
+    }
     if (strcmp(cmd, "probe") == 0) {
         return cmd_probe();
     } else if (strcmp(cmd, "processes") == 0) {
@@ -4653,20 +4723,20 @@ int main(int argc, char **argv) {
         return cmd_maps(pid, filter);
     } else if (strcmp(cmd, "read") == 0 && argc >= 5) {
         int pid = atoi(argv[2]);
-        uint64_t addr = strtoull(argv[3], NULL, 0);
+        uint64_t addr = parse_addr(argv[3]);
         size_t sz = (size_t)strtoul(argv[4], NULL, 0);
         return cmd_read(pid, addr, sz);
     } else if (strcmp(cmd, "write") == 0 && argc >= 5) {
         int pid = atoi(argv[2]);
-        uint64_t addr = strtoull(argv[3], NULL, 0);
+        uint64_t addr = parse_addr(argv[3]);
         return cmd_write(pid, addr, argv[4]);
     } else if (strcmp(cmd, "read_val") == 0 && argc >= 5) {
         int pid = atoi(argv[2]);
-        uint64_t addr = strtoull(argv[3], NULL, 0);
+        uint64_t addr = parse_addr(argv[3]);
         return cmd_read_val(pid, addr, argv[4]);
     } else if (strcmp(cmd, "write_val") == 0 && argc >= 6) {
         int pid = atoi(argv[2]);
-        uint64_t addr = strtoull(argv[3], NULL, 0);
+        uint64_t addr = parse_addr(argv[3]);
         return cmd_write_val(pid, addr, argv[4], argv[5]);
     } else if (strcmp(cmd, "scan") == 0 && argc >= 5) {
         int pid = atoi(argv[2]);
@@ -4738,7 +4808,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "ptr_scan") == 0 && argc >= 4) {
         // ptr_scan <pid> <target_addr> [max_offset] [max_matches] [align] [filter_perms]
         int pid = atoi(argv[2]);
-        uint64_t target_addr = strtoull(argv[3], NULL, 0);
+        uint64_t target_addr = parse_addr(argv[3]);
         uint32_t max_offset = argc >= 5 ? (uint32_t)strtoul(argv[4], NULL, 0) : 0;
         uint32_t max_matches = argc >= 6 ? (uint32_t)strtoul(argv[5], NULL, 0) : 256;
         int align = argc >= 7 ? atoi(argv[6]) : 8;
@@ -4747,7 +4817,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "ptr_chain_auto") == 0 && argc >= 4) {
         // ptr_chain_auto <pid> <target_addr> [max_depth] [max_offset] [max_matches] [module] [filter_perms]
         int pid = atoi(argv[2]);
-        uint64_t target_addr = strtoull(argv[3], NULL, 0);
+        uint64_t target_addr = parse_addr(argv[3]);
         int max_depth = argc >= 5 ? atoi(argv[4]) : 4;
         uint32_t max_offset = argc >= 6 ? (uint32_t)strtoul(argv[5], NULL, 0) : 0x400;
         uint32_t max_matches = argc >= 7 ? (uint32_t)strtoul(argv[6], NULL, 0) : 10;
@@ -4791,7 +4861,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "watch") == 0 && argc >= 4) {
         // watch <pid> <addr> [size] [type] [duration_ms] [max_hits]
         int pid = atoi(argv[2]);
-        uint64_t addr = strtoull(argv[3], NULL, 0);
+        uint64_t addr = parse_addr(argv[3]);
         size_t sz = argc >= 5 ? (size_t)strtoul(argv[4], NULL, 0) : 4;
         const char *t = argc >= 6 ? argv[5] : "w";
         uint32_t dur = argc >= 7 ? (uint32_t)strtoul(argv[6], NULL, 0) : 2000;
@@ -4814,11 +4884,59 @@ int main(int argc, char **argv) {
         return cmd_list_threads(atoi(argv[2]));
     } else if (strcmp(cmd, "set_reg") == 0 && argc >= 6) {
         // set_reg <pid> <tid> <reg> <val>
-        return cmd_set_register(atoi(argv[2]), atoi(argv[3]), argv[4], strtoull(argv[5], NULL, 0));
+        return cmd_set_register(atoi(argv[2]), atoi(argv[3]), argv[4], parse_addr(argv[5]));
     } else if (strcmp(cmd, "run_lua") == 0 && argc >= 4) {
         // run_lua <pid> <script_path|-> [timeout_s]
         return cmd_run_lua(atoi(argv[2]), argv[3],
                            argc >= 5 ? atoi(argv[4]) : LUA_TIMEOUT_DEFAULT);
+    } else if (strcmp(cmd, "lua_state") == 0 && argc >= 3) {
+        // lua_state <pid>
+        return lua_state_cmd(atoi(argv[2]));
+    } else if (strcmp(cmd, "lua_capture") == 0 && argc >= 3) {
+        // lua_capture <pid> [duration_ms]
+        return cmd_lua_capture(atoi(argv[2]),
+                               argc >= 4 ? (uint32_t)strtoul(argv[3], NULL, 0) : 3000);
+    } else if (strcmp(cmd, "lua_scan") == 0 && argc >= 3) {
+        // lua_scan <pid> --anchor <string> [--max-candidates N]
+        const char *anchor = NULL;
+        uint32_t maxc = 8;
+        for (int i = 3; i < argc; i++) {
+            if (strcmp(argv[i], "--anchor") == 0 && i + 1 < argc) {
+                anchor = argv[++i];
+            } else if (strcmp(argv[i], "--max-candidates") == 0 && i + 1 < argc) {
+                maxc = (uint32_t)strtoul(argv[++i], NULL, 0);
+            }
+        }
+        if (!anchor) {
+            print_error("lua_scan requires --anchor <string>", EINVAL);
+            return 1;
+        }
+        return lua_scan_cmd(atoi(argv[2]), anchor, maxc);
+    } else if (strcmp(cmd, "lua_walk") == 0 && argc >= 3) {
+        // lua_walk <pid> [name_filter] [limit]
+        const char *nf = argc >= 4 ? argv[3] : NULL;
+        uint32_t lim = argc >= 5 ? (uint32_t)strtoul(argv[4], NULL, 0) : 256;
+        return lua_walk_cmd(atoi(argv[2]), nf, lim);
+    } else if (strcmp(cmd, "lua_exec") == 0 && argc >= 4) {
+        // lua_exec <pid> <code> [timeout_ms]
+        return cmd_lua_exec(atoi(argv[2]), argv[3],
+                            argc >= 5 ? (uint32_t)strtoul(argv[4], NULL, 0)
+                                      : XCALL_TIMEOUT_MS_DEFAULT);
+    } else if (strcmp(cmd, "call_func") == 0 && argc >= 4) {
+        // call_func <pid> <addr> [arg ...] [--tid N] [--timeout MS]
+        int tid = 0;
+        uint32_t tmo = XCALL_TIMEOUT_MS_DEFAULT;
+        char *clean[4];
+        int nclean = 0;
+        for (int i = 4; i < argc; i++) {
+            if (strcmp(argv[i], "--tid") == 0 && i + 1 < argc) tid = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc)
+                tmo = (uint32_t)strtoul(argv[++i], NULL, 0);
+            else if (nclean < 4) clean[nclean++] = argv[i];
+            else { print_error("at most 4 positional arguments", E2BIG); return 1; }
+        }
+        return cmd_call_func(atoi(argv[2]), tid, parse_addr(argv[3]),
+                             nclean, clean, tmo);
     }
 
     print_error("Unknown command or missing arguments", EINVAL);
